@@ -1,0 +1,19 @@
+# 运行期状态与本地配置：不进版本库
+.env
+self_oid.txt
+self_name.txt
+*.log
+boot.log
+seen.json
+groups.json
+threads.json
+tasks.json
+.selfask.lock
+snapshots/
+
+# Python
+__pycache__/
+*.pyc
+
+# 本地归档
+.module-stubs-archive-*/
