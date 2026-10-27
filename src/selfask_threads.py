@@ -16,7 +16,8 @@ from selfask_util import log, human_dur, _hhmm
 from selfask_state import (thread_get, thread_put, thread_ensure, thread_alloc,
                            conv_threads, thread_key, threads_snapshot)
 from selfask_gateway import (session_state, session_send, session_abort,
-                             session_reset, history_raw, await_reply)
+                             session_reset, history_raw, await_reply,
+                             question_pending, question_resolve)
 from selfask_dingtalk import send_reply, check_live_health
 
 _slots = threading.Semaphore(MAX_CONCURRENCY)   # 同时在跑的线程数上限
@@ -118,6 +119,18 @@ def monitor_thread(conv_id, n, groups, skey, base_ts, started, mid=None,
         if thread_get(conv_id, n).get("state") != "running":
             log("thread monitor stop n=%d (state changed)" % n)
             return "abandoned"
+        # ask_user 的问题没有通道可送（dthread 会话不是聊天会话），只能
+        # 主动从网关捞出来转发；每个问题只发一次，别每 20s 刷屏。
+        q = question_pending(skey)
+        if q and thread_get(conv_id, n).get("q_forwarded") != q.get("id"):
+            log("question forwarded n=%d id=%s" % (n, q.get("id")))
+            send_reply(conv_id, mid, question_prompt(n, q), groups, "-question")
+            thread_put(conv_id, n, q_forwarded=q.get("id"),
+                       q_deadline=q.get("expiresAtMs") or 0)
+        if q:
+            # 卡在问题上不算「没起来」，也别让心跳插进来刷屏
+            last_report = now
+
         st, err = session_state(skey, since_ms=base_ts)
         # 只认本轮 run 的正文；没有 run_id 就退回全部（兼容历史记录）
         texts = list((st or {}).get("texts") or [])
@@ -162,7 +175,7 @@ def monitor_thread(conv_id, n, groups, skey, base_ts, started, mid=None,
                        status="done", preview=_preview_line(text))
             return "done"
 
-        if now - last_report >= PROGRESS_EVERY:
+        if not q and now - last_report >= PROGRESS_EVERY:
             last_report = now
             bits = ["线程会话%d 还在跑，没停（已 %s）。" % (n, human_dur(elapsed))]
             tail = (mine[-1]["text"] if mine else "") or ""
@@ -203,7 +216,7 @@ def slash_thread(conv_id, n, skey, raw, mid, groups):
     为什么不维护命令白名单：OpenClaw 自带几十条斜杠命令，还在增加，逐个枚举
     永远追不上。这里只按「是不是 / 开头」分流，命令本身交给网关认。
 
-    为什么必须裸发：投普通任务时正文前面拼了 UNATTENDED_NOTE，而斜杠命令只有
+    为什么必须裸发：投普通任务时正文前面拼了 UNATTENDED_NOTE（首条与 push 同一行），而斜杠命令只有
     位于整条消息开头才被识别，加了前缀就退化成普通对话内容（`aa1 /new` 连发
     三次都没重置，就是这么来的）。
 
@@ -284,6 +297,72 @@ def reset_thread(conv_id, n, skey, mid, groups):
     send_reply(conv_id, mid, msg, groups, "-reset")
 
 
+_LETTERS = "ABCDEFGH"
+
+
+def question_prompt(n, q):
+    """把待答问题翻成一份适合钉钉读的纯文本（块之间空行，别糊成一段）。"""
+    qs = q.get("questions") or []
+    left = max(0, int(q.get("expiresAtMs") or 0) / 1000.0 - time.time())
+    head = ("线程会话%d 停下来等你拍板，约 %s 内有效；不回就按默认继续。"
+            % (n, human_dur(left)))
+    if len(qs) == 1:
+        tail = "回 `aa%d <选项或你自己的答案>` 继续。" % n
+    else:
+        tail = ("共 %d 个问题，按顺序用 `|` 隔开作答：`aa%d 答案1 | 答案2…`"
+                % (len(qs), n))
+    blocks = [head]
+    for i, item in enumerate(qs):
+        lines = ["%s【%s】%s" % ("%d. " % (i + 1) if len(qs) > 1 else "",
+                                 (item.get("header") or "问题").strip(),
+                                 (item.get("question") or "").strip())]
+        for j, opt in enumerate(item.get("options") or []):
+            label = (opt.get("label") or "").strip()
+            desc = (opt.get("description") or "").strip()
+            mark = "%s." % _LETTERS[j] if j < len(_LETTERS) else "-"
+            lines.append("  %s %s%s" % (mark, label, (" — " + desc) if desc else ""))
+        if not (item.get("options") or []):
+            lines.append("  （无预设选项，直接回文字）")
+        blocks.append("\n".join(lines))
+    blocks.append(tail)
+    return "\n\n".join(blocks)
+
+
+def _norm_answer(text):
+    return (text or "").strip()
+
+
+def _plain_answers(q, text):
+    """正文原样当答案：每个问题都填同一句，不再猜选项。
+
+    为什么不猜了：用户要的是「转发给我、我 push 回一句」，不是做选择题。
+    猜错的代价（把他正常的一句新指令当成 A/B 选项吞掉）比猜对的价值大，
+    所以这里只做透传；能不能收下由网关的 validateAnswers 判，失败就退回普通 push。
+    """
+    answers = {}
+    for item in (q.get("questions") or []):
+        qid = item.get("questionId")
+        if qid:
+            answers[qid] = [_norm_answer(text)]
+    return answers
+
+
+def _answer_pending(conv_id, q, n, text, mid, groups):
+    """把 push 正文交回待答问题，返回 (ok, err)。"""
+    answers = _plain_answers(q, text)
+    if not answers:
+        return False, "no-question-id"
+    ok, err = question_resolve(q["id"], answers)
+    if not ok:
+        log("question resolve fail id=%s %s" % (q.get("id"), (err or "")[:160]))
+        return False, err or "unknown"
+    log("question resolved id=%s answers=%s" % (q.get("id"), answers))
+    send_reply(conv_id, mid,
+               "线程会话%d 已把这条答复交回问题，继续跑，有结果我再发。" % n,
+               groups, "-qanswer")
+    return True, ""
+
+
 def push_thread(conv_id, n, question, mid, groups):
     """`aaN 正文`：往线程 N 投一条。跑着就 steer 进当前 run，空闲就开新一轮。
 
@@ -308,6 +387,21 @@ def push_thread(conv_id, n, question, mid, groups):
                    groups, "-fail")
         return
     busy = bool(st and st["active"])
+
+    # 线程正卡在 ask_user 上：这条正文就是答案，走 question.resolve 交回去，
+    # 不能再当普通消息 push——那只会排在新一轮，原问题继续等超时。
+    # 只在 run 还活着时当答案：问题记录可能因 run 被取消而残留到过期，
+    # 那种残留不该把用户正常的新任务吞掉。
+    q = question_pending(skey) if busy else None
+    if q:
+        ok, err = _answer_pending(conv_id, q, n, question, mid, groups)
+        if ok:
+            thread_put(conv_id, n, q_forwarded=None, q_deadline=0)
+            return
+        # 交不上去（过期/已被答/答案不合法）：退回普通 push，别把话吞掉
+        send_reply(conv_id, mid,
+                   "线程会话%d 的问题没交上去（%s），按普通消息继续。"
+                   % (n, (err or "")[:160]), groups, "-qfail")
 
     info, err2 = session_send(skey, UNATTENDED_NOTE + question, steer=busy)
     if not info:
@@ -442,6 +536,8 @@ def thread_status_text(conv_id, n):
     if st.get("active"):
         elapsed = time.time() - (t.get("started") or time.time())
         blocks.append("**线程会话%d** · 在跑 · 已 %s" % (n, human_dur(elapsed)))
+        if t.get("q_forwarded"):
+            blocks.append("**在等你回答**：问题已转发，回 `aa%d <选项或文字>` 就继续。" % n)
         if tools:
             counts = {}
             for name in tools:

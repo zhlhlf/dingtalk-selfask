@@ -82,4 +82,27 @@ with tempfile.TemporaryDirectory() as tmp:
     finally:
         selfask_state._store = old_store
 
-print("PASS: routing, import surface, threads.json merge-on-first-write, latest_thread")
+import selfask_threads as th
+
+# 5) ask_user 转发：转发文案 + 原样透传答案（纯函数，不打网关）
+Q = {"id": "q1", "expiresAtMs": int((__import__("time").time() + 600) * 1000),
+     "questions": [{"questionId": "deploy", "header": "部署", "question": "发布到哪",
+                    "options": [{"label": "Staging (Recommended)", "value": "staging"},
+                                {"label": "Production"}]}]}
+txt = th.question_prompt(3, Q)
+assert "线程会话3" in txt and "A. Staging (Recommended)" in txt
+assert "aa3" in txt and "\n\n" in txt
+# 答案原样透传：不猜选项，A/B 与整句都照发，收不收由网关判
+assert th._plain_answers(Q, "B") == {"deploy": ["B"]}
+assert th._plain_answers(Q, "  Production，但先备份 ") == {"deploy": ["Production，但先备份"]}
+Q2 = {"id": "q2", "expiresAtMs": 0, "questions": [
+    {"questionId": "a", "header": "A", "question": "甲", "options": []},
+    {"questionId": "b", "header": "B", "question": "乙", "options": []}]}
+assert set(th._plain_answers(Q2, "都行").keys()) == {"a", "b"}
+# 提示词只剩一行，且不再提 ask_user（2026-10-27 起 ask_user 在 dthread 直接报错）
+from selfask_config import UNATTENDED_NOTE
+assert "不要用 ask_user" in UNATTENDED_NOTE and "停下等我回复" in UNATTENDED_NOTE
+assert UNATTENDED_NOTE.count("\n") == 2 and len(UNATTENDED_NOTE.encode()) < 300
+
+print("PASS: routing, import surface, threads.json merge-on-first-write, "
+      "latest_thread, question-forward + plain answers")

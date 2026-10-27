@@ -237,6 +237,54 @@ def session_reset(skey):
     return True, ""
 
 
+def question_pending(skey):
+    """该会话挂着的待答问题，没有就返回 None。
+
+    `ask_user` 的问题只渲染在会话自己的通道上。dthread 会话是用 `chat.send`
+    起的，没有通道，问题就落进虚空、等 900s 超时 → `no_answer`。唯一能拿到
+    它的地方是 `question.list`：记录里带 sessionKey/runId/expiresAtMs。
+    已过期但还没被回收的记录要滤掉，否则会对着空气转发。
+    """
+    rc, out, err = gw_call("question.list", {}, timeout=20)
+    if rc != 0:
+        return None
+    try:
+        d = json.loads(out)
+    except Exception:
+        return None
+    now_ms = int(time.time() * 1000)
+    for q in (d.get("questions") or []):
+        if q.get("sessionKey") != skey:
+            continue
+        if q.get("status") != "pending":
+            continue
+        if int(q.get("expiresAtMs") or 0) <= now_ms:
+            continue
+        return q
+    return None
+
+
+def question_resolve(qid, answers, by="dingtalk-selfask"):
+    """替人提交答案。answers 形如 {questionId: ["值"]}，返回 (ok, err)。
+
+    走 `question.resolve`，不是往会话里再发一条消息——ask_user 是阻塞的工具
+    调用，只有 resolve 能让它带着答案返回，后续工具调用才会继续。
+    """
+    params = {"id": qid, "answers": {"answers": answers}, "resolvedBy": by}
+    rc, out, err = gw_call("question.resolve", params, timeout=30)
+    if rc == 0 and '"status": "answered"' in (out or ""):
+        return True, ""
+    detail = (err or out or "").strip()
+    try:
+        d = json.loads(out or "")
+        msg = ((d.get("error") or {}).get("message") or "").strip()
+        if msg:
+            detail = msg
+    except Exception:
+        pass
+    return False, detail[-300:]
+
+
 def _msg_id(m):
     """一条消息的稳定标识，用来区分「这条是新的」。"""
     ow = m.get("__openclaw") or {}
