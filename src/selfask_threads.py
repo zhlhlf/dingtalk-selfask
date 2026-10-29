@@ -570,13 +570,34 @@ def rewind_thread(conv_id, n, skey, arg, mid, groups):
                    "线程会话%d 回退失败：%s" % (n, (err or "")[:250]),
                    groups, "-rewind-fail")
         return
+    # 网关说成功不等于真的剪了：实测这条会话（多 session window 的长会话）
+    # 上 sessions.rewind 只新开了个窗口把历史整段复制过来，一条都没裁。
+    # 所以按 id 复核——被撤的那条还在，就走「分叉到同一位置」这条兜底路。
+    swapped = None
+    if _history_has(skey, nxt["id"]):
+        log("thread rewind n=%d 原生没落地，改走 fork 兜底" % n)
+        finfo, ferr = fork_at_message(skey, nxt["id"])
+        if not finfo:
+            t_reply(n, conv_id, mid,
+                       "线程会话%d 回退没生效：网关报告成功，但历史里第 %d 条之后"
+                       "还在；改用分叉兜底也失败（%s）。没有改动线程指向，"
+                       "可以再试一次或先 `aa%d /his` 核对。"
+                       % (n, index, (ferr or "")[:200], n), groups,
+                       "-rewind-noeffect")
+            return
+        swapped = finfo["key"]
+        info = finfo
     dropped = his_prune(skey, index + 1)
+    if swapped:
+        his_prune(swapped, index + 1)
     thread_put(conv_id, n, state="idle", started=None, base_ts=0,
                status="rewind", pushes=0, deliver=False, last_ok=time.time(),
                run="", last_msg="rewind@%d" % index, preview="rewind@%d" % index,
-               q_forwarded=None, q_deadline=0)
-    log("thread rewind n=%d idx=%d dropped=%d key=%s"
-        % (n, index, dropped, _short_skey(skey)))
+               q_forwarded=None, q_deadline=0,
+               **({"key": swapped} if swapped else {}))
+    log("thread rewind n=%d idx=%d dropped=%d key=%s%s"
+        % (n, index, dropped, _short_skey(swapped or skey),
+           " (fork fallback)" if swapped else ""))
     cut = _strip_note(info.get("text") or nxt.get("text") or "")
     lines = ["线程会话%d 已回退到第 %d 条之后：保留 #1–#%d，撤掉 #%d 起（`%s`）。"
              % (n, index, index, index + 1, _short_skey(info.get("key") or skey)),
@@ -588,6 +609,12 @@ def rewind_thread(conv_id, n, skey, arg, mid, groups):
     lines.append("改完直接发 `aa%d <正文>`，不想改就继续。" % n)
     lines.append("提醒：只回退了上下文，**之前跑过的命令、改过的文件还在**；"
                  "编号 >= %d 的已作废，要重新分叉先 `/his`。" % (index + 1))
+    if swapped:
+        lines.append("")
+        lines.append("说明：网关原生回退这次没落地（历史没被裁），我改用"
+                     "「分叉到同一位置」把它做成了，线程现在指向新会话 "
+                     "`%s`；旧会话完整历史留在 `%s`，没删。"
+                     % (_short_skey(swapped), _short_skey(skey)))
     t_reply(n, conv_id, mid, "\n".join(lines), groups, "-rewind")
 
 
@@ -659,6 +686,17 @@ def _gateway_msg_id(m):
     """一条消息的稳定标识（网关历史里的），用来做回显收取的 id 基线。"""
     ow = m.get("__openclaw") or {}
     return ow.get("id") or ("ts:%s" % m.get("timestamp"))
+
+
+def _history_has(skey, entry_id):
+    """历史里还有没有这条消息（用来复核 rewind 到底剪没剪）。"""
+    try:
+        for m in history_raw(skey, limit=500) or []:
+            if _gateway_msg_id(m) == entry_id:
+                return True
+    except Exception:
+        pass
+    return False
 
 
 def reset_thread(conv_id, n, skey, mid, groups):
