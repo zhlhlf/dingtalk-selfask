@@ -293,6 +293,40 @@ def fork_at_message(source_skey, entry_id):
     return {"key": key, "text": d.get("editorText") or ""}, None
 
 
+def rewind_at_message(skey, entry_id):
+    """把会话回退到某条**用户消息之前**（`sessions.rewind`）。
+
+    与 fork 的区别：fork 生成本地新会话（线程要改 key），rewind 就在原会话上
+    把活跃分支剪回去（key 不变），所以不用改线程指向。
+
+    返回 (info, err)，info = {"key", "text"}，text 是被撤掉那条的原文
+    （网关的 editorText，回给用户改完再发）。错误状态与 fork 同一套：
+    missing-entry / off-active-path / not-user-message / unsupported-storage，
+    另外会话有活跃 run 时网关直接拒（Rewind is unavailable while the agent
+    is working），所以调用方要先判忙。
+    """
+    rc, out, err = gw_call("sessions.rewind",
+                           {"sessionKey": skey, "entryId": entry_id},
+                           timeout=90)
+    if rc != 0:
+        detail = (out or "").strip()
+        try:
+            d = json.loads(detail)
+            msg = ((d.get("error") or {}).get("message") or "").strip()
+            if msg:
+                detail = msg
+        except Exception:
+            pass
+        return None, (detail or err or "")[-300:]
+    try:
+        d = json.loads(out)
+    except Exception as e:
+        return None, "sessions.rewind json fail %r" % e
+    if d.get("ok") is False or d.get("error"):
+        return None, json.dumps(d.get("error"), ensure_ascii=False)[:300]
+    return {"key": skey, "text": d.get("editorText") or ""}, None
+
+
 def session_fork(parent_skey, child_skey, fork_from="last-completed"):
     """把 parent 的上下文复制进 child_skey 这个新会话，返回 (info, err)。
 

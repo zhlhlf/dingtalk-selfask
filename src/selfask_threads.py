@@ -16,12 +16,12 @@ from selfask_config import (TASK_HARD_LIMIT, PROGRESS_EVERY, POLL_INTERVAL,
 from selfask_util import log, human_dur, _hhmm
 from selfask_state import (thread_get, thread_put, thread_ensure, thread_alloc,
                            conv_threads, thread_key, threads_snapshot,
-                           his_put, his_get)
+                           his_put, his_get, his_prune)
 from selfask_gateway import (session_state, session_send, session_abort,
                              session_reset, stop_run, history_raw, await_reply,
                              question_pending, question_resolve,
                              session_fork, history_count, fork_at_message,
-                             _msg_text)
+                             rewind_at_message, _msg_text)
 from selfask_dingtalk import send_reply as _send_reply, check_live_health
 
 
@@ -257,6 +257,12 @@ def slash_thread(conv_id, n, skey, raw, mid, groups):
     if cmd == "/his":
         history_index_thread(conv_id, n, skey, mid, groups)
         return
+    # `/rewind` 也必须是本地的：网关的斜杠层同样拿发起 chat.send 的连接当
+    # owner，语义也对不上（我们要的是「剪到第 N 条之前」，不是它自己的回退）。
+    if cmd == "/rewind":
+        rewind_thread(conv_id, n, skey,
+                      parts[1] if len(parts) > 1 else "", mid, groups)
+        return
     if cmd in STOP_CMDS:
         stop_thread(conv_id, n, skey, mid, groups)
         return
@@ -372,17 +378,21 @@ def history_index_thread(conv_id, n, skey, mid, groups):
         numbered.append((num, item))
     his_put(skey, [{"n": it["n"], "id": it["id"], "text": it["text"], "at": it["at"]}
                    for _, it in numbered])
-    lines = ["线程会话%d · `%s`" % (n, skey), ""]
+    rows = []
     for num, item in numbered:
         stamp = _hhmm(item["at"] / 1000.0) if item["at"] else ""
-        lines.append("%d. %s%s" % (num, ("（%s）" % stamp) if stamp else "",
-                                   item["text"][:80]))
-    lines.append("")
+        rows.append("%d. %s%s" % (num, ("（%s）" % stamp) if stamp else "",
+                                  item["text"][:80]))
+    # 列表中间插一个「回退到这儿」的标记：钉在最新一条之前，说明 /rewind 会
+    # 把这条及之后都从上下文里撤掉（用户 2026-10-29 要的可视切点）。
+    last = numbered[-1][0]
+    cut_mark = "   ⟲ 回退到这儿 → `aa%d /rewind %d`" % (n, last)
+    rows.insert(len(rows) - 1, cut_mark)
+    lines = ["线程会话%d · `%s`" % (n, skey), ""] + rows + [""]
     if total > len(shown):
         lines.append("只列最近 %d 条，共 %d 条。" % (len(shown), total))
     # 分叉命令单独用 text 围栏包起来：钉钉只有 markdown 模式会渲染围栏，
     # send_reply 见到围栏就切 --markdown，用户点一下就能整行复制。
-    last = numbered[-1][0]
     lines.append("从第 N 条之前分叉（整行复制，改末尾数字）：")
     lines.append("```text")
     lines.append("aa%d /fork %s %d" % (n, skey, last))
@@ -480,6 +490,76 @@ def fork_thread(conv_id, n, skey, arg, mid, groups):
                "接着发 `aa%d <正文>` 就在这份上下文上继续。"
                % (n, "强制新开（原有上下文已替换）" if replaced else "新开",
                   _short_skey(source), n), groups, "-fork")
+
+
+def rewind_thread(conv_id, n, skey, arg, mid, groups):
+    """`aaN /rewind <编号>`：把线程 N 的会话回退到第 N 条用户消息之前。
+
+    与 `/fork` 的分工很关键：
+    - `/fork <key> <n>` 是**另开一份**（新 key，原会话不动），用来试别的走法；
+    - `/rewind <n>` 是**就地剪回去**（key 不变），被撤掉的那条原文由网关从
+      editorText 回给我们，改完直接发就能重来。
+
+    编号来自线程自己的 `aaN /his`（entry id 已在生成时钉死）。回退后 >= 编号
+    的 entry 都不在活跃分支上了，所以顺手把那些编号从表里删掉，避免下次
+    `/fork <key> <旧编号>` 撞 `off-active-path`。
+
+    注意：rewind 只动上下文，**撤不掉工具副作用**（已经改的文件、跑掉的命令
+    都还在），回执里要说清。
+    """
+    arg = (arg or "").strip().replace("`", "").replace("'", "").replace('"', "")
+    if arg and not arg.isdigit():
+        t_reply(n, conv_id, mid,
+                   "编号要写数字：`aa%d /rewind <编号>`。先发 `aa%d /his` 拿编号。"
+                   % (n, n), groups, "-rewind-usage")
+        return
+    rec = thread_get(conv_id, n)
+    st, _ = session_state(skey)
+    if rec.get("state") == "running" or (st or {}).get("active"):
+        t_reply(n, conv_id, mid,
+                   "线程会话%d 正在跑，现在不能回退（网关也会拒：Rewind is "
+                   "unavailable while the agent is working）。先 `aa%d /stop`。"
+                   % (n, n), groups, "-rewind-busy")
+        return
+    if not arg:
+        t_reply(n, conv_id, mid,
+                   "用法：`aa%d /rewind <编号>`，把这条及之后的都从上下文里撤掉。"
+                   "先发 `aa%d /his`，列表里那个「⟲ 回退到这儿」就是默认编号。"
+                   % (n, n), groups, "-rewind-usage")
+        return
+    index = int(arg)
+    item = his_get(skey, index)
+    if not item:
+        t_reply(n, conv_id, mid,
+                   "没有编号 %d 的记录：先发 `aa%d /his` 生成编号表"
+                   "（编号只在生成时有效，之后新消息不会改动它）。"
+                   % (index, n), groups, "-rewind-noidx")
+        return
+    info, err = rewind_at_message(item.get("key") or skey, item["id"])
+    if not info:
+        t_reply(n, conv_id, mid,
+                   "线程会话%d 回退失败：%s" % (n, (err or "")[:250]),
+                   groups, "-rewind-fail")
+        return
+    dropped = his_prune(skey, index)
+    thread_put(conv_id, n, state="idle", started=None, base_ts=0,
+               status="rewind", pushes=0, deliver=False, last_ok=time.time(),
+               run="", last_msg="rewind@%d" % index, preview="rewind@%d" % index,
+               q_forwarded=None, q_deadline=0)
+    log("thread rewind n=%d idx=%d dropped=%d key=%s"
+        % (n, index, dropped, _short_skey(skey)))
+    cut = _strip_note(info.get("text") or item.get("text") or "")
+    lines = ["线程会话%d 已回退到第 %d 条之前（`%s`）。"
+             % (n, index, _short_skey(info.get("key") or skey)), ""]
+    if cut:
+        lines.append("撤掉的那条原文：")
+        lines.append(cut[:400])
+        lines.append("")
+    lines.append("现在上下文就停在它前面；改完直接发 `aa%d <正文>`，不想改就继续。"
+                 % n)
+    lines.append("提醒：只回退了上下文，**之前跑过的命令、改过的文件还在**；"
+                 "编号 >= %d 的已作废，要重新分叉先 `/his`。" % index)
+    t_reply(n, conv_id, mid, "\n".join(lines), groups, "-rewind")
 
 
 def fork_at_index_thread(conv_id, n, skey, source, index, mid, groups):

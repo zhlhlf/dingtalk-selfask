@@ -69,6 +69,27 @@ def his_get(skey, n):
     return None
 
 
+def his_prune(skey, cutoff):
+    """回退/替换历史后，把 >= cutoff 的编号从表里删掉（那些 entry 已不在活跃分支上）。"""
+    with _his_lock:
+        data = _his_load()
+        key = _his_key(skey)
+        row = data.get(key)
+        if not row:
+            return 0
+        before = row.get("items") or []
+        row["items"] = [it for it in before if int(it.get("n") or 0) < int(cutoff)]
+        dropped = len(before) - len(row["items"])
+        tmp = HIS + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp, HIS)
+        except Exception:
+            pass
+        return dropped
+
+
 class ThreadStore:
     """线程表：首次写盘前先并入磁盘状态，绝不让空内存覆盖磁盘上的记录。
 
