@@ -44,18 +44,20 @@ from selfask_state import (Store, load_seen, save_threads, load_threads,  # noqa
                            thread_get, threads_merge, threads_snapshot)
 from selfask_gateway import (gw_call, session_state, session_send,  # noqa: F401
                              session_abort, session_reset, history_raw,
-                             await_reply, gw_health, refresh_egress_env)
+                             await_reply, gw_health, refresh_egress_env,
+                             session_fork, history_count)
 from selfask_dingtalk import (send_reply, load_groups, chunk_text,  # noqa: F401
                               kill_stale_listeners, _pump_stderr, spawn_consumer,
                               check_live_health)
 from selfask_threads import (start_thread, monitor_thread, push_thread,  # noqa: F401
-                             slash_thread, reset_thread, resume_threads,
+                             slash_thread, reset_thread, fork_thread,
+                             resume_threads,
                              status_text, thread_status_text, latest_thread,
                              aa_overview_text, is_slash, thread_put,
                              thread_ensure, thread_alloc, conv_threads,
                              thread_key)
 from selfask_commands import (CMD_NEW, CMD_PUSH, CMD_STAT, CMD_SLASH,  # noqa: F401
-                              CMD_OVERVIEW, parse_cmd,
+                              CMD_OVERVIEW, CMD_OVERVIEW_KEYS, parse_cmd,
                               strip_mention as _strip_mention)
 
 
@@ -98,6 +100,14 @@ def handle_incoming(store, groups, mid, conv, content, src):
         threading.Thread(
             target=send_reply,
             args=(conv, mid, aa_overview_text(conv), groups, "-aa"),
+            daemon=True).start()
+        return
+
+    if kind == CMD_OVERVIEW_KEYS:
+        log("Q* conv=%s id=%s src=%s (aa0 overview with keys)" % (conv, mid, src))
+        threading.Thread(
+            target=send_reply,
+            args=(conv, mid, aa_overview_text(conv, with_keys=True), groups, "-aa0"),
             daemon=True).start()
         return
 

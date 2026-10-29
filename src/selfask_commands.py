@@ -3,6 +3,7 @@ import re
 
 CMD_NEW, CMD_PUSH, CMD_STAT, CMD_SLASH = "new", "push", "status", "slash"
 CMD_OVERVIEW = "overview"
+CMD_OVERVIEW_KEYS = "overview_keys"
 
 
 def strip_mention(text, self_name):
@@ -17,6 +18,10 @@ def parse_cmd(body):
     # 裸 `aa`（整句就这两个字母）：本会话线程一览。`aa ` 带尾随空格仍算忽略。
     if body == "aa":
         return CMD_OVERVIEW, None, ""
+    # `aa0`：和 `aa` 一样的一览，但每条多打一行会话 key，方便复制去 `/fork`。
+    # 只认整句（允许尾随空白）；`aa0 x` 仍然按「0 号线程」忽略。
+    if re.match(r"^aa0\s*$", body):
+        return CMD_OVERVIEW_KEYS, None, ""
     if not body.startswith("aa"):
         return None, None, "not-aa"
     rest = body[2:]

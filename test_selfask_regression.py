@@ -14,7 +14,10 @@ cases = {
     "/status": (None, None, "not-aa"),
     "aa /status": (None, None, "slash-ignored"),
     "aa": ("overview", None, ""),
+    "aa0": ("overview_keys", None, ""),
+    "aa0 ": ("overview_keys", None, ""),
     "aa7 /new": ("push", 7, "/new"),
+    "aa7 /fork dthread-abc": ("push", 7, "/fork dthread-abc"),
     "aa1": ("status", 1, ""),
     "aa1 follow up": ("push", 1, "follow up"),
     "aa 任务开始": ("new", None, "任务开始"),
@@ -36,7 +39,8 @@ for name in ("main", "parse_task", "parse_cmd", "strip_mention", "thread_get",
              "send_reply", "push_thread", "slash_thread", "reset_thread",
              "monitor_thread", "latest_thread", "status_text",
              "thread_status_text", "is_slash", "save_threads", "load_threads",
-             "resume_threads", "chunk_text"):
+             "resume_threads", "chunk_text", "fork_thread", "session_fork",
+             "history_count"):
     assert hasattr(selfask, name), name
 
 # 3) 纯 load 不得标记已合并；随后 save 不得丢磁盘上的 running 线程

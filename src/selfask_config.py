@@ -49,10 +49,12 @@ def _local(name):
 SELF_OID = os.environ.get("SELFASK_SELF_OID") or _local("self_oid.txt")
 SELF_NAME = os.environ.get("SELFASK_SELF_NAME") or _local("self_name.txt")
 REPLY_MARKER = "🤖"
-# 四种命令，全部严格匹配（大小写敏感、`aa` 后必须是空格或数字）
+# 命令全部严格匹配（大小写敏感、`aa` 后必须是空格或数字）
 #   `aa <正文>`    → 新建线程会话
 #   `aa<N> <正文>` → push 进线程 N（跑着就 steer，下一轮工具调用前带上）
 #   `aa<N>`        → 只看线程 N 的现状，不 push
+#   `aa0`          → 线程一览 + 每条会话 key（方便复制去 `/fork`）
+#   `aa<N> /fork <会话key>` → 新开线程 N，复制指定会话的上下文（源会话不动）
 #   `/xxx`         → OpenClaw 斜杠命令，本地拦截裸发进网关
 HOME = "/root"
 # BASE 钉在仓库根（本文件在 src/ 里，向上一级才是数据/日志/备份所在处）
@@ -77,7 +79,7 @@ CHUNK_BYTES = int(os.environ.get("SELFASK_CHUNK_BYTES", "30000"))    # 单条消
 # 消息就是没到进程。实测 2026-10-23 十小时内本人发出的 20 条 aa 消息丢了 6 条（30%），
 # 且丢的那些进程日志里连「收到」都没有，说明丢在 dws 推流那一层，重连救不了。
 # 所以必须有第二条通道：固定周期查历史接口，喂给同一个 handle_incoming，靠 message_id 去重。
-BACKFILL_EVERY = int(os.environ.get("SELFASK_BACKFILL_EVERY", "30"))
+BACKFILL_EVERY = int(os.environ.get("SELFASK_BACKFILL_EVERY", "15"))  # 2026-10-28 30→15：推流不推「自己发的无@消息」，补拉是唯一通道
 BACKFILL_WINDOW = int(os.environ.get("SELFASK_BACKFILL_WINDOW", "120"))
 BACKFILL_DELAY = int(os.environ.get("SELFASK_BACKFILL_DELAY", "15"))
 # 启动首轮回看更远：进程停机期间漏掉的（以及停机前不久静默丢掉的）都能一次捞回。

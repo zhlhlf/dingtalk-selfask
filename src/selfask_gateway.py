@@ -237,6 +237,59 @@ def session_reset(skey):
     return True, ""
 
 
+def session_fork(parent_skey, child_skey, fork_from="last-completed"):
+    """把 parent 的上下文复制进 child_skey 这个新会话，返回 (info, err)。
+
+    走 `sessions.create { parentSessionKey, fork: true, key }`：
+    - `key` 显式指定，线程 N 的会话 key 保持不变，push/monitor 不用改指向；
+    - `forkFrom: "last-completed"` 只复制到最后一条完整的助手消息，源会话
+      正在跑时也能 fork，且不会把半截输出带进去；
+    - 源会话只读不写，fork 不动它。
+    注意：如果 child_skey 已经有历史，网关会把它的旧 transcript 换掉
+    （response 里带 previousSessionId）。调用方必须先确认目标是空线程。
+    """
+    params = {"parentSessionKey": parent_skey, "fork": True, "key": child_skey}
+    if fork_from:
+        params["forkFrom"] = fork_from
+    rc, out, err = gw_call("sessions.create", params, timeout=90)
+    if rc != 0:
+        detail = (out or "").strip()
+        try:
+            d = json.loads(detail)
+            msg = ((d.get("error") or {}).get("message") or "").strip()
+            if msg:
+                detail = msg
+        except Exception:
+            pass
+        return None, (detail or err or "")[-300:]
+    try:
+        d = json.loads(out)
+    except Exception as e:
+        return None, "sessions.create json fail %r" % e
+    if d.get("ok") is False or d.get("error"):
+        return None, json.dumps(d.get("error"), ensure_ascii=False)[:300]
+    entry = d.get("entry") or {}
+    return {"key": d.get("key") or entry.get("key") or child_skey,
+            "sessionId": d.get("sessionId") or entry.get("sessionId") or "",
+            "forked": bool(entry.get("forkedFromParent"))}, None
+
+
+def history_count(skey, limit=200):
+    """数一个会话有多少条消息，返回 (count, err)。查失败时 count 为 None。
+
+    只用来判「目标线程是不是空的」和「源会话是不是真的有东西」，
+    不参与正文判定；limit 只是上限，超过也按 limit 算。
+    """
+    rc, out, err = gw_call("chat.history", {"sessionKey": skey, "limit": limit})
+    if rc != 0:
+        return None, ((_clean_err(err) or _clean_err(out)) or "rc=%s" % rc)[-200:]
+    try:
+        d = json.loads(out)
+    except Exception as e:
+        return None, "history json fail %r" % e
+    return len(d.get("messages") or []), ""
+
+
 def question_pending(skey):
     """该会话挂着的待答问题，没有就返回 None。
 

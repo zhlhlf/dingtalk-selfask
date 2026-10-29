@@ -17,7 +17,8 @@ from selfask_state import (thread_get, thread_put, thread_ensure, thread_alloc,
                            conv_threads, thread_key, threads_snapshot)
 from selfask_gateway import (session_state, session_send, session_abort,
                              session_reset, history_raw, await_reply,
-                             question_pending, question_resolve)
+                             question_pending, question_resolve,
+                             session_fork, history_count)
 from selfask_dingtalk import send_reply, check_live_health
 
 _slots = threading.Semaphore(MAX_CONCURRENCY)   # 同时在跑的线程数上限
@@ -223,7 +224,14 @@ def slash_thread(conv_id, n, skey, raw, mid, groups):
     唯一例外是 reset 家族：`/new` 走 chat.send 会被网关拒（不是这个会话的
     owner），必须改用 sessions.reset。这个例外有实测依据，不是猜的。
     """
-    cmd = raw.strip().split()[0].lower()
+    parts = raw.strip().split(None, 1)
+    cmd = parts[0].lower()
+    # `/fork` 是本地命令：不交给网关的斜杠层（网关没有这条），而是把指定会话
+    # 的上下文复制进线程 N，源会话只读不写。
+    if cmd == "/fork":
+        fork_thread(conv_id, n, skey, parts[1] if len(parts) > 1 else "",
+                    mid, groups)
+        return
     if cmd in RESET_CMDS:
         reset_thread(conv_id, n, skey, mid, groups)
         return
@@ -259,6 +267,91 @@ def slash_thread(conv_id, n, skey, raw, mid, groups):
                    groups, "-slash-empty")
         return
     send_reply(conv_id, mid, out, groups, "-slash")
+
+
+def _short_skey(skey):
+    """显示/比较用的短 key：`agent:main:dthread-x` → `dthread-x`。"""
+    value = (skey or "").strip().strip("`'\"")
+    return value.split(":")[-1] if ":" in value else value
+
+
+def _same_skey(a, b):
+    return bool(a) and bool(b) and _short_skey(a) == _short_skey(b)
+
+
+def fork_thread(conv_id, n, skey, source, mid, groups):
+    """`aaN /fork <会话key>`：把指定会话的上下文复制进线程 N（新会话）。
+
+    约束（都是有意的）：
+    - **只往空线程里复制**。网关的 `sessions.create` 对已存在的 key 会替换
+      transcript（返回 previousSessionId），直接覆盖会把线程 N 原来的上下文
+      悄悄弄丢；所以先查目标有没有消息，有就拒绝，让用户换号或先 `/new`。
+    - **源会话只读**。只把它当 `parentSessionKey`，不 reset、不 push。
+    - 正在跑的线程不 fork：目标线程可能正被 monitor 盯着，换 transcript 会让
+      这一轮的 runId/历史对不上。
+    """
+    source = (source or "").strip().strip("`'\"")
+    if not source:
+        send_reply(conv_id, mid,
+                   "用法：`aa%d /fork <会话key>`。发 `aa0` 能看到各线程的 key，"
+                   "直接复制过来。" % n, groups, "-fork-usage")
+        return
+    if _same_skey(source, skey):
+        send_reply(conv_id, mid,
+                   "线程会话%d 的 key 就是 `%s`，源和目标同一个会话，不用 fork。"
+                   % (n, _short_skey(skey)), groups, "-fork-same")
+        return
+    rec = thread_get(conv_id, n)
+    if rec.get("state") == "running":
+        send_reply(conv_id, mid,
+                   "线程会话%d 正在跑，现在不能 fork（换 transcript 会把这一轮"
+                   "的上下文弄乱）。等它结束，或先 `aa%d /new`。" % (n, n),
+                   groups, "-fork-busy")
+        return
+
+    count, err = history_count(skey, limit=1)
+    if err or count is None:
+        send_reply(conv_id, mid,
+                   "线程会话%d 查不到状态（%s），这次没 fork。"
+                   % (n, (err or "")[:150]), groups, "-fork-fail")
+        return
+    if count:
+        send_reply(conv_id, mid,
+                   "线程会话%d 已经有上下文了，`/fork` 只往空线程里复制。"
+                   "换一个没用过的编号（`aa0` 看现状），或先 `aa%d /new` 清空再试。"
+                   % (n, n), groups, "-fork-used")
+        return
+
+    scount, serr = history_count(source, limit=1)
+    if serr or scount is None:
+        send_reply(conv_id, mid,
+                   "源会话 `%s` 查不到（%s）。检查 key 是否抄对；`aa0` 里的 key "
+                   "可以直接复制。" % (source, (serr or "")[:120]),
+                   groups, "-fork-srcfail")
+        return
+    if not scount:
+        send_reply(conv_id, mid,
+                   "源会话 `%s` 没有历史消息（key 不对，或者它本来就是空的）。"
+                   "发 `aa0` 核对一下 key。" % source, groups, "-fork-empty")
+        return
+
+    info, ferr = session_fork(source, skey)
+    if not info:
+        send_reply(conv_id, mid,
+                   "线程会话%d fork 失败：%s" % (n, (ferr or "")[:250]),
+                   groups, "-fork-fail")
+        return
+    thread_put(conv_id, n, state="idle", started=None, base_ts=0, status="fork",
+               pushes=0, deliver=False, last_ok=time.time(), run="",
+               last_msg="fork: " + _short_skey(source),
+               preview="fork: " + _short_skey(source),
+               forked_from=source, q_forwarded=None, q_deadline=0)
+    log("thread fork n=%d src=%s session=%s"
+        % (n, _short_skey(source), (info.get("sessionId") or "")[:12]))
+    send_reply(conv_id, mid,
+               "线程会话%d 已新开，已复制 `%s` 的上下文；原会话没动。\n"
+               "接着发 `aa%d <正文>` 就在这份上下文上继续。"
+               % (n, _short_skey(source), n), groups, "-fork")
 
 
 def _gateway_msg_id(m):
@@ -625,7 +718,7 @@ def _rel(sec):
     return "%dh%dm" % (sec // 3600, (sec % 3600) // 60)
 
 
-def aa_overview_text(conv_id):
+def aa_overview_text(conv_id, with_keys=False):
     """裸 `aa`：本会话线程一览，一条线程一行。
 
     格式（2026-10-27 按用户给的参考样式定稿）：
@@ -663,6 +756,8 @@ def aa_overview_text(conv_id):
                 emoji, label = "🔴", "失败"
             elif status == "reset":
                 emoji, label = "⚪", "已重置"
+            elif status == "fork":
+                emoji, label = "⚪", "已 fork"
             else:
                 emoji, label = "⚪", "已完成"
             if last_ok:
@@ -675,6 +770,9 @@ def aa_overview_text(conv_id):
         # Markdown 列表、吃掉项间换行），行之间靠空行分行。
         line = "%s aa%d %s" % (emoji, n, label)
         line += (" · " + prev) if prev else " · （无记录）"
+        if with_keys:
+            key = t.get("key") or thread_key(conv_id, n)
+            line += "\n   key: " + _short_skey(key)
         lines.append(line)
     style = (os.environ.get("SELFASK_AA_STYLE") or "fence").lower()
     if style == "compact":

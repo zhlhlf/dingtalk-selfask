@@ -3,30 +3,41 @@
 2026-10-22 落地；2026-10-23 重做成**线程模型**：`aa ` 建一个线程会话，`aa<N> ` 往线程 N 里 push，`aa<N>` 只看现状。
 用途：在钉钉里自己发命令，助手在该会话里回话。全程走已登录的 dws 个人身份，不需要机器人 AppKey、不需要企业内部应用审批。
 
-## 三种命令
+## 命令
 
 | 你发的 | 行为 | 助手回什么 |
 | --- | --- | --- |
+| `aa` | 本会话线程一览（在跑 / 排队 / 空闲） | 纯列表，一条线程一行 |
+| `aa0` | 同 `aa`，但每条线程多打一行**会话 key** | 列表 + `key: dthread-…`，方便复制去 `/fork` |
 | `aa <正文>` | 新建线程会话，把正文交给它干活 | `线程会话N 创建成功，正在处理…` |
 | `aa<N> <正文>` | push 进线程 N；**跑着就 steer 进当前 run**，可连续多次 | `线程会话N push消息成功`（空闲时改为「刚才空闲…按新一轮开始跑了」） |
 | `aa<N>` | 不 push，只报线程 N 现状 | `线程会话N 正在跑（已 Xm，累计 push M 条）` / `现在空闲…` |
-| `/xxx`、`aa /xxx`、`aa<N> /xxx` | 交给该会话的 OpenClaw 斜杠命令层；`/new`、`/reset`、`/clear` 重置线程 | 命令回显，或重置确认 |
+| `aa<N> /xxx` | 交给该会话的 OpenClaw 斜杠命令层；`/new`、`/reset`、`/clear` 重置线程 | 命令回显，或重置确认 |
+| `aa<N> /fork <会话key>` | 新开线程 N，把指定会话的上下文复制进来；**源会话只读不写** | `线程会话N 已新开，已复制 … 的上下文；原会话没动。` |
 
-严格匹配、大小写敏感：`aa` 后必须是半角空格或数字。`aa`、`aa `、`aa正文`、`AA `、`aa1x` 都不触发。
+严格匹配、大小写敏感：`aa` 后必须是半角空格或数字。裸 `/xxx`、`aa /xxx`、`aa `、`aa正文`、`AA `、`aa1x` 都不触发。
+
+`/fork` 的三条约束：
+1. 目标线程 N 必须是**空线程**（已有上下文会拒绝，避免网关替换 transcript 时静默丢历史）；换号或先 `aa<N> /new`。
+2. 线程 N 正在跑时不许 fork。
+3. 源会话按 `parentSessionKey` 只读复制，复制到最后一条完整的助手消息（`forkFrom: "last-completed"`）。
 
 ## 触发条件
 
-**本人发送** + 剥掉 `@周后霖` / `<@oid>` 前缀后才判定（三条命令都吃 `aa` 前缀）。
+**本人发送** + 剥掉 `@周后霖` / `<@oid>` 前缀后才判定（这些命令都吃 `aa` 前缀）。
 
 | 正文 | 结果 |
 | --- | --- |
+| `aa` | ✅ 本会话线程一览 |
+| `aa0` | ✅ 线程一览 + 每条会话 key |
 | `aa 帮我看看日志` | ✅ 新建线程，任务「帮我看看日志」 |
 | `<@self> aa 群里任务` | ✅ 同上（先剥 @） |
 | `aa1 再补一句` | ✅ push 进线程 1 |
 | `aa1` / `aa1 ` | ✅ 只查线程 1 现状 |
-| `/status` / `aa1 /status` | ✅ 路由到最近使用的 / 1 号线程，裸发给 OpenClaw |
+| `aa1 /status` | ✅ 裸发给 1 号线程所在的 OpenClaw 会话 |
+| `aa2 /fork dthread-96b3b8fe999a` | ✅ 新建 2 号线程，复制该会话的上下文（源会话不动） |
 | `aa1 /new` | ✅ 中断后重置 1 号线程，清空其上下文 |
-| `aa` / `aa ` / `aa正文` / `AA 大写` / `aa1x` | ❌ 不算命令，日志记 `ignore not-aa` / `empty-after-aa` |
+| `/status` / `aa /status` / `aa ` / `aa正文` / `AA 大写` / `aa1x` | ❌ 不算命令，日志记 `ignore not-aa` / `empty-after-aa` / `slash-ignored` |
 | `🤖 回答…` | ❌ 自己的回复，防自激 |
 
 ### 订阅范围（实测，决定要不要 @ 自己）
@@ -49,7 +60,7 @@
 - Gateway 会话层：`selfask_gateway.py`。RPC 调用、会话读写（`session_state` / `session_send`）、abort→reset 兑底、斜杠回显收取（`await_reply`）。
 - 钉钉 I/O：`selfask_dingtalk.py`。发消息（含群 @ 占位符与幂等键）、长连接子进程、群表、旧监听清理。
 - 线程编排：`selfask_threads.py`。`aa` 线程生命周期、push/steer、slash 裸发与回显、reset、监控、本地状态文案；依赖上面全部。
-- 命令解析：`selfask_commands.py`。剥 @ 前缀与严格 `aa` / `aa<N>` / slash 解析；纯函数，无状态。
+- 命令解析：`selfask_commands.py`。剥 @ 前缀与严格 `aa` / `aa0` / `aa<N>` / slash 解析；纯函数，无状态。
 - 装配层：`selfask_app.py`。消息路由（`handle_incoming`）、监听循环、周期补拉、单实例锁、`main()`。
 - 离线回归：`test_selfask_regression.py`。覆盖路由语义、薄入口兼容面、纯 load 后 save 不丢 running 线程、`latest_thread` 逃线程。
 - 守护脚本：`watchdog.sh`
@@ -117,7 +128,7 @@ send_reply → dws chat message send（群：--conversation-id + @占位符；�
 | --- | --- |
 | `selfask.py` | 瘦入口，只调 `main()` |
 | `selfask_app.py` | 事件循环、命令路由、消息去重、补拉、网关健康自检 |
-| `selfask_commands.py` | 命令解析（`aa` / `aaN` / `aaN 正文` / 斜杠） |
+| `selfask_commands.py` | 命令解析（`aa` / `aa0` / `aaN` / `aaN 正文` / 斜杠；`/fork` 在 threads 层） |
 | `selfask_threads.py` | 线程生命周期：起跑、push/steer、监控、超时、重置、aa 面板文案 |
 | `selfask_gateway.py` | 封装 `chat.send` / `chat.history` / `sessions.abort|reset`，以及本轮正文与工具名提取 |
 | `selfask_dingtalk.py` | 收发：`event consume` 解析、`chat message send` 分片发送、@ 占位符 |
