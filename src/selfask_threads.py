@@ -385,14 +385,21 @@ def history_index_thread(conv_id, n, skey, mid, groups):
                                   item["text"][:80]))
     # 列表中间插一个「回退到这儿」的标记：钉在最新一条之前，说明 /rewind 会
     # 把这条及之后都从上下文里撤掉（用户 2026-10-29 要的可视切点）。
+    # 命令本身不写在这里——它有自己的 text 围栏，别和 /fork 挤在一块。
     last = numbered[-1][0]
-    cut_mark = "   ⟲ 回退到这儿 → `aa%d /rewind %d`" % (n, last)
+    cut_mark = "   ⟲ 回退到这儿（第 %d 条之前）" % last
     rows.insert(len(rows) - 1, cut_mark)
     lines = ["线程会话%d · `%s`" % (n, skey), ""] + rows + [""]
     if total > len(shown):
         lines.append("只列最近 %d 条，共 %d 条。" % (len(shown), total))
-    # 分叉命令单独用 text 围栏包起来：钉钉只有 markdown 模式会渲染围栏，
+    # 回退、分叉各自一块 text 围栏：钉钉只有 markdown 模式会渲染围栏，
     # send_reply 见到围栏就切 --markdown，用户点一下就能整行复制。
+    # 两块必须分开（用户 2026-10-29 要求），复制时不会连成一行。
+    lines.append("回退到这儿（整行复制，改末尾数字）：")
+    lines.append("```text")
+    lines.append("aa%d /rewind %d" % (n, last))
+    lines.append("```")
+    lines.append("")
     lines.append("从第 N 条之前分叉（整行复制，改末尾数字）：")
     lines.append("```text")
     lines.append("aa%d /fork %s %d" % (n, skey, last))
