@@ -260,6 +260,39 @@ def session_reset(skey):
     return True, ""
 
 
+def fork_at_message(source_skey, entry_id):
+    """从一条**用户消息**处切出「这条之前」的前缀，建成一个新会话。
+
+    走 `sessions.fork { sessionKey, entryId }`。网关要求 entryId 是活跃分支上
+    的 user 消息，否则回 missing-entry / off-active-path / not-user-message。
+    新会话 key 由网关生成（不能指定），所以调用方要把线程改指到它。
+    返回里的 `editorText` 是被切掉那条消息的原文，回给用户改完再发。
+    """
+    rc, out, err = gw_call("sessions.fork",
+                           {"sessionKey": source_skey, "entryId": entry_id},
+                           timeout=90)
+    if rc != 0:
+        detail = (out or "").strip()
+        try:
+            d = json.loads(detail)
+            msg = ((d.get("error") or {}).get("message") or "").strip()
+            if msg:
+                detail = msg
+        except Exception:
+            pass
+        return None, (detail or err or "")[-300:]
+    try:
+        d = json.loads(out)
+    except Exception as e:
+        return None, "sessions.fork json fail %r" % e
+    if d.get("ok") is False or d.get("error"):
+        return None, json.dumps(d.get("error"), ensure_ascii=False)[:300]
+    key = (d.get("sessionKey") or "").strip()
+    if not key:
+        return None, "sessions.fork 没返回 sessionKey"
+    return {"key": key, "text": d.get("editorText") or ""}, None
+
+
 def session_fork(parent_skey, child_skey, fork_from="last-completed"):
     """把 parent 的上下文复制进 child_skey 这个新会话，返回 (info, err)。
 

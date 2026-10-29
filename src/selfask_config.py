@@ -142,3 +142,6 @@ RESET_CMDS = ("/new", "/reset", "/clear")
 # owner 校验，而本守护每次都是新的 gateway call 短连接 → 恒返回 unauthorized
 # （2026-10-29 用户实测）。本地拦下、直接调 sessions.abort 才停得下来。
 STOP_CMDS = ("/stop", "/abort")
+
+# `/his` 一次最多列多少条自己的消息（编号仍按全量顺序给）
+HIS_SHOW = 20

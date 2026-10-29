@@ -12,6 +12,62 @@ import time
 
 from selfask_config import THREADS, THREAD_PREFIX, STATE
 
+HIS = os.path.join(os.path.dirname(THREADS), "his_index.json")
+HIS_MAX_KEYS = 20
+HIS_MAX_ITEMS = 200
+_his_lock = threading.Lock()
+
+
+def _his_load():
+    try:
+        with open(HIS) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _his_key(skey):
+    """编号表按短 key 索引：`agent:main:dthread-x` 与 `dthread-x` 都能查到。"""
+    value = (skey or "").strip().strip("`'\"")
+    return value.split(":")[-1] if ":" in value else value
+
+
+def his_put(skey, items):
+    """记下这次 `/his` 的编号表：编号 → 消息 entry id。
+
+    编号必须落盘：`/his` 只回一段文本，之后用户可能隔几分钟才发
+    `/fork <key> <编号>`；这期间会话可能又多了几条消息，按「当前历史的第 n 条」
+    重新数会指到另一条上去。所以编号在生成时就钉死 entry id。
+    """
+    with _his_lock:
+        data = _his_load()
+        data[_his_key(skey)] = {"ts": time.time(), "key": skey,
+                                "items": list(items)[-HIS_MAX_ITEMS:]}
+        if len(data) > HIS_MAX_KEYS:
+            keep = sorted(data.items(), key=lambda kv: kv[1].get("ts") or 0)[-HIS_MAX_KEYS:]
+            data = dict(keep)
+        tmp = HIS + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp, HIS)
+        except Exception:
+            pass
+
+
+def his_get(skey, n):
+    """取编号 n 对应的记录（没记录返回 None）。"""
+    with _his_lock:
+        data = _his_load()
+    row = data.get(_his_key(skey)) or {}
+    for item in row.get("items") or []:
+        if int(item.get("n") or 0) == int(n):
+            out = dict(item)
+            out.setdefault("key", row.get("key") or skey)
+            return out
+    return None
+
 
 class ThreadStore:
     """线程表：首次写盘前先并入磁盘状态，绝不让空内存覆盖磁盘上的记录。

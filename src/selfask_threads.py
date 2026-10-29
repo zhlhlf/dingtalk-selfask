@@ -12,14 +12,16 @@ import time
 
 from selfask_config import (TASK_HARD_LIMIT, PROGRESS_EVERY, POLL_INTERVAL,
                             MAX_CONCURRENCY, UNATTENDED_NOTE, RESET_CMDS,
-                            STOP_CMDS)
+                            STOP_CMDS, HIS_SHOW)
 from selfask_util import log, human_dur, _hhmm
 from selfask_state import (thread_get, thread_put, thread_ensure, thread_alloc,
-                           conv_threads, thread_key, threads_snapshot)
+                           conv_threads, thread_key, threads_snapshot,
+                           his_put, his_get)
 from selfask_gateway import (session_state, session_send, session_abort,
                              session_reset, stop_run, history_raw, await_reply,
                              question_pending, question_resolve,
-                             session_fork, history_count)
+                             session_fork, history_count, fork_at_message,
+                             _msg_text)
 from selfask_dingtalk import send_reply, check_live_health
 
 _slots = threading.Semaphore(MAX_CONCURRENCY)   # 同时在跑的线程数上限
@@ -237,6 +239,9 @@ def slash_thread(conv_id, n, skey, raw, mid, groups):
         fork_thread(conv_id, n, skey, parts[1] if len(parts) > 1 else "",
                     mid, groups)
         return
+    if cmd == "/his":
+        history_index_thread(conv_id, n, skey, mid, groups)
+        return
     if cmd in STOP_CMDS:
         stop_thread(conv_id, n, skey, mid, groups)
         return
@@ -287,27 +292,105 @@ def _same_skey(a, b):
     return bool(a) and bool(b) and _short_skey(a) == _short_skey(b)
 
 
-def fork_thread(conv_id, n, skey, source, mid, groups):
-    """`aaN /fork <会话key>`：把指定会话的上下文复制进线程 N（新会话）。
+def _his_text(m):
+    """把一条历史消息压成一行可读文本（剥掉无人值守前缀）。"""
+    text = _msg_text(m) or ""
+    if text.startswith(UNATTENDED_NOTE.strip()):
+        text = text[len(UNATTENDED_NOTE.strip()):].lstrip()
+    text = " ".join(text.split())
+    return text
+
+
+def history_index_thread(conv_id, n, skey, mid, groups):
+    """`aaN /his`：报出线程 N 的会话 key + 我自己发过的消息（带编号）。
+
+    只列 role=user 的消息，因为 `/fork <key> <编号>` 的切点必须是用户消息
+    （网关 `sessions.fork` 也只接受 user entry）。编号在生成时就把 entry id
+    钉进 `his_index.json`：之后会话又多了几条消息，按当前历史重新数会指错。
+    """
+    msgs = history_raw(skey, limit=200)
+    if not msgs:
+        send_reply(conv_id, mid,
+                   "线程会话%d 没读到历史（`%s`）。gateway 忙或 key 不对，"
+                   "稍后再发一次。" % (n, skey), groups, "-his-empty")
+        return
+    items = []
+    for m in msgs:
+        if (m.get("role") or "") != "user":
+            continue
+        text = _his_text(m)
+        if not text:
+            continue
+        items.append({"id": _gateway_msg_id(m), "text": text[:200],
+                      "at": int(m.get("timestamp") or 0)})
+    if not items:
+        send_reply(conv_id, mid,
+                   "线程会话%d 还没有你自己发的消息（`%s`）。"
+                   % (n, skey), groups, "-his-none")
+        return
+    total = len(items)
+    shown = items[-HIS_SHOW:]
+    numbered = []
+    for i, item in enumerate(shown):
+        num = total - len(shown) + i + 1
+        item["n"] = num
+        numbered.append((num, item))
+    his_put(skey, [{"n": it["n"], "id": it["id"], "text": it["text"], "at": it["at"]}
+                   for _, it in numbered])
+    lines = ["线程会话%d · `%s`" % (n, skey), ""]
+    for num, item in numbered:
+        stamp = _hhmm(item["at"] / 1000.0) if item["at"] else ""
+        lines.append("%d. %s%s" % (num, ("（%s）" % stamp) if stamp else "",
+                                   item["text"][:80]))
+    lines.append("")
+    if total > len(shown):
+        lines.append("只列最近 %d 条，共 %d 条。" % (len(shown), total))
+    lines.append("从第 n 条之前分叉：`aa%d /fork %s <编号>`" % (n, skey))
+    send_reply(conv_id, mid, "\n".join(lines), groups, "-his")
+
+
+def fork_thread(conv_id, n, skey, arg, mid, groups):
+    """`aaN /fork <会话key> [编号]`：把源会话的上下文装进线程 N。
+
+    两种用法：
+    - `aaN /fork <key>`：整段上下文（`sessions.create` 显式指定线程 key，
+      所以线程 key 不变）；
+    - `aaN /fork <key> <编号>`：从该会话第 N 条**用户消息之前**切一份
+      （`sessions.fork`，编号来自 `aaM /his`）。这条由网关生成本地新 key，
+      所以线程 N 会**改指到新 key**，旧 transcript 留在原 key 上不动。
 
     约束（都是有意的）：
     - **目标线程强制重建**：网关的 `sessions.create` 对已存在的 key 会替换
-      transcript（返回 previousSessionId，旧记录进归档）。用户 2026-10-29
-      明确要求「直接强制新建再 fork」，所以不再因为目标有上下文而拒绝；
-      但回执必须说清楚「原有上下文已被替换」，不能静默丢。
+      transcript。用户 2026-10-29 要求「直接强制新建再 fork」，所以不再因为
+      目标有上下文而拒绝；但回执必须写明「原有上下文已被替换」。
     - 目标线程正在跑时仍然拒绝：换 transcript 会让 monitor 的 runId/历史对不上。
-    - **源会话只读**。只把它当 `parentSessionKey`，不 reset、不 push。
+    - **源会话只读**。整段 fork 只把它当 parent；按消息 fork 只读它的前缀，
+      源会话既不 reset 也不 push。
     """
-    source = (source or "").strip().strip("`'\"")
+    toks = (arg or "").replace("`", "").replace("'", "").replace('"', "").split()
+    source = toks[0] if toks else ""
+    index = toks[1] if len(toks) > 1 else ""
+    if index and not index.isdigit():
+        send_reply(conv_id, mid,
+                   "编号要写数字：`aa%d /fork <会话key> <编号>`。"
+                   "先发 `aa%d /his` 拿编号。" % (n, n), groups, "-fork-usage")
+        return
+    if index:
+        fork_at_index_thread(conv_id, n, skey, source, int(index), mid, groups)
+        return
     if not source:
         send_reply(conv_id, mid,
-                   "用法：`aa%d /fork <会话key>`。发 `aa0` 能看到各线程的 key，"
-                   "直接复制过来。" % n, groups, "-fork-usage")
+                   "用法：`aa%d /fork <会话key>` 整段复制；"
+                   "`aa%d /fork <会话key> <编号>` 从某条消息之前分叉"
+                   "（编号先发 `/his` 拿）。发 `aa0` 能看到各线程的 key。" % (n, n),
+                   groups, "-fork-usage")
         return
     if _same_skey(source, skey):
         send_reply(conv_id, mid,
-                   "线程会话%d 的 key 就是 `%s`，源和目标同一个会话，不用 fork。"
-                   % (n, _short_skey(skey)), groups, "-fork-same")
+                   "线程会话%d 的 key 就是 `%s`，整段复制到自己身上没有意义。"
+                   "想回到以前某一条，用 `aa%d /fork %s <编号>`。"
+                   % (n, _short_skey(skey), n, _short_skey(skey)),
+                   groups, "-fork-same")
         return
     rec = thread_get(conv_id, n)
     if rec.get("state") == "running":
@@ -356,6 +439,61 @@ def fork_thread(conv_id, n, skey, source, mid, groups):
                "接着发 `aa%d <正文>` 就在这份上下文上继续。"
                % (n, "强制新开（原有上下文已替换）" if replaced else "新开",
                   _short_skey(source), n), groups, "-fork")
+
+
+def fork_at_index_thread(conv_id, n, skey, source, index, mid, groups):
+    """`aaN /fork <key> <编号>`：从某条用户消息之前分叉，线程 N 改指新会话。
+
+    走网关的 `sessions.fork`：它只接受活跃分支上的 user 消息，子会话 key 由
+    网关生成，所以线程 N 必须**换 key**（旧 key 的 transcript 原样保留）。
+    编号来自 `aaM /his` 的落盘表，不按当前历史现数。
+    """
+    rec = thread_get(conv_id, n)
+    st, _ = session_state(skey)
+    if rec.get("state") == "running" or (st or {}).get("active"):
+        send_reply(conv_id, mid,
+                   "线程会话%d 正在跑，现在不能 fork（换会话会把这一轮弄乱）。"
+                   "等它结束，或先 `aa%d /stop`。" % (n, n), groups, "-fork-busy")
+        return
+    item = his_get(source, index)
+    if not item:
+        send_reply(conv_id, mid,
+                   "没有编号 %d 的记录：先在源会话发 `aaM /his` 看编号，"
+                   "编号会记在源会话 key 上（`%s`）。" % (index, _short_skey(source)),
+                   groups, "-fork-noidx")
+        return
+    # 编号表里记着完整 key：用户只抄短 key 也能分叉
+    source = item.get("key") or source
+    info, err = fork_at_message(source, item["id"])
+    if not info:
+        send_reply(conv_id, mid,
+                   "线程会话%d 分叉失败：%s" % (n, (err or "")[:250]),
+                   groups, "-fork-fail")
+        return
+    old_key = skey
+    thread_put(conv_id, n, key=info["key"], state="idle", started=None,
+               base_ts=0, status="fork-msg", pushes=0, deliver=False,
+               last_ok=time.time(), run="",
+               last_msg="fork@%d: %s" % (index, _short_skey(source)),
+               preview="fork@%d: %s" % (index, _short_skey(source)),
+               forked_from=source, q_forwarded=None, q_deadline=0)
+    log("thread fork@msg n=%d src=%s idx=%d -> %s"
+        % (n, _short_skey(source), index, _short_skey(info["key"])))
+    lines = ["线程会话%d 已从 `%s` 的第 %d 条之前分叉，"
+             "线程现在指向 `%s`。" % (n, _short_skey(source), index,
+                                      _short_skey(info["key"])), ""]
+    cut = (info.get("text") or item.get("text") or "").strip()
+    if cut:
+        lines.append("被切出来的那条原文：")
+        lines.append(cut[:400])
+        lines.append("")
+    lines.append("接着发 `aa%d <正文>` 就停在那条之前，改完再发；"
+                 "不想改就直接继续。" % n)
+    if not _same_skey(old_key, info["key"]):
+        lines.append("")
+        lines.append("原会话 `%s` 没动，完整历史还在那里。"
+                     % _short_skey(old_key))
+    send_reply(conv_id, mid, "\n".join(lines), groups, "-fork-msg")
 
 
 def _gateway_msg_id(m):
