@@ -64,6 +64,12 @@ def chunk_text(text):
             cur = (cur + "\n" + line) if cur else line
     if cur:
         parts.append(cur)
+    # 分片刚好切在代码块中间时，给上一片补闭合、下一片补重开：
+    # 否则钉钉会把半截围栏当普通文字，整段排版都是坏的。
+    for i in range(len(parts) - 1):
+        if parts[i].count("```") % 2 == 1:
+            parts[i] = parts[i] + "\n```"
+            parts[i + 1] = "```text\n" + parts[i + 1]
     return parts
 
 

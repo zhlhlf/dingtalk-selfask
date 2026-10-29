@@ -381,8 +381,9 @@ def history_index_thread(conv_id, n, skey, mid, groups):
     rows = []
     for num, item in numbered:
         stamp = _hhmm(item["at"] / 1000.0) if item["at"] else ""
-        rows.append("%d. %s%s" % (num, ("（%s）" % stamp) if stamp else "",
-                                  item["text"][:80]))
+        # 正文里万一带围栏，先废掉，免得把外层 text 块截断
+        body = item["text"][:80].replace("```", "'''")
+        rows.append("%d. %s%s" % (num, ("（%s）" % stamp) if stamp else "", body))
     # 切点插在两条之间：**保留**上面那条，撤掉下面那条起（用户 2026-10-29
     # 纠正：选中的编号那条也要保留）。默认钉在最后两条中间，即「撤掉最新
     # 一条、保留它之前的」。只有 1 条时没有可切的位置，不插标记。
@@ -390,7 +391,11 @@ def history_index_thread(conv_id, n, skey, mid, groups):
     if keep is not None:
         cut_mark = "   ⟲ 回退到这儿（保留第 %d 条，撤掉第 %d 条起）" % (keep, keep + 1)
         rows.insert(len(rows) - 1, cut_mark)
-    lines = ["线程会话%d · `%s`" % (n, skey), ""] + rows + [""]
+    # 列表整体用 text 围栏包住（用户 2026-10-29 要求）：等宽、整块可复制，
+    # 也不会让钉钉把「1.」当成 markdown 有序列表吃掉缩进。
+    lines = ["线程会话%d · `%s`" % (n, skey), "", "```text"]
+    lines.extend(rows)
+    lines.extend(["```", ""])
     if total > len(shown):
         lines.append("只列最近 %d 条，共 %d 条。" % (len(shown), total))
     # 回退、分叉各自一块 text 围栏：钉钉只有 markdown 模式会渲染围栏，
