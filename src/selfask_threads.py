@@ -341,21 +341,14 @@ def _strip_note(text):
     return body
 
 
-def history_index_thread(conv_id, n, skey, mid, groups):
-    """`aaN /his`：报出线程 N 的会话 key + 我自己发过的消息（带编号）。
+def _collect_items(skey):
+    """读出会话里**我自己发过的**消息（剥掉无人值守前缀后非空的）。
 
-    只列 role=user 的消息，因为 `/fork <key> <编号>` 的切点必须是用户消息
-    （网关 `sessions.fork` 也只接受 user entry）。编号在生成时就把 entry id
-    钉进 `his_index.json`：之后会话又多了几条消息，按当前历史重新数会指错。
+    只收 role=user：`sessions.fork` 的切点必须是 user entry，编号表也只该
+    包含能当切点的消息。
     """
-    msgs = history_raw(skey, limit=500)
-    if not msgs:
-        t_reply(n, conv_id, mid,
-                   "线程会话%d 没读到历史（`%s`）。gateway 忙或 key 不对，"
-                   "稍后再发一次。" % (n, skey), groups, "-his-empty")
-        return
     items = []
-    for m in msgs:
+    for m in history_raw(skey, limit=500) or []:
         if (m.get("role") or "") != "user":
             continue
         text = _his_text(m)
@@ -363,13 +356,16 @@ def history_index_thread(conv_id, n, skey, mid, groups):
             continue
         items.append({"id": _gateway_msg_id(m), "text": text[:200],
                       "at": int(m.get("timestamp") or 0)})
-    if not items:
-        t_reply(n, conv_id, mid,
-                   "线程会话%d 还没有你自己发的消息（`%s`）。"
-                   % (n, skey), groups, "-his-none")
-        return
+    return items
+
+
+def _number_items(skey, items):
+    """给最近 HIS_SHOW 条编上全量序号，并把 entry id 钉进 his_index.json。
+
+    编号在这里落盘（而不是用的时候现数）：用户可能隔几分钟才 `/fork`，
+    期间历史增长会重新数错。HIS_SHOW<=0 表示全列。
+    """
     total = len(items)
-    # HIS_SHOW<=0 表示全列：用户 2026-10-29 明确要求「列表默认展示全部」。
     shown = items if HIS_SHOW <= 0 else items[-HIS_SHOW:]
     numbered = []
     for i, item in enumerate(shown):
@@ -378,44 +374,54 @@ def history_index_thread(conv_id, n, skey, mid, groups):
         numbered.append((num, item))
     his_put(skey, [{"n": it["n"], "id": it["id"], "text": it["text"], "at": it["at"]}
                    for _, it in numbered])
+    return numbered, total
+
+
+def _hist_block(n, skey, numbered, keep=None, mark=None):
+    """列表本体（整块 text 围栏：等宽、可整块复制，钉钉也不会把「1.」当列表吃掉）。
+
+    `mark` 给了就插在第 `keep` 条之后。只有真要用切点的地方（`/rewind` 不带
+    编号、带编号的 `/fork`）才传，`/his` 自己永远不插（用户 2026-10-29 要求）。
+    """
     rows = []
     for num, item in numbered:
         stamp = _hhmm(item["at"] / 1000.0) if item["at"] else ""
         # 正文里万一带围栏，先废掉，免得把外层 text 块截断
         body = item["text"][:80].replace("```", "'''")
         rows.append("%d. %s%s" % (num, ("（%s）" % stamp) if stamp else "", body))
-    # 切点插在两条之间：**保留**上面那条，撤掉下面那条起（用户 2026-10-29
-    # 纠正：选中的编号那条也要保留）。默认钉在最后两条中间，即「撤掉最新
-    # 一条、保留它之前的」。只有 1 条时没有可切的位置，不插标记。
-    keep = numbered[-2][0] if len(numbered) >= 2 else None
-    if keep is not None:
-        cut_mark = "   ⟲ 回退到这儿（保留第 %d 条，撤掉第 %d 条起）" % (keep, keep + 1)
-        rows.insert(len(rows) - 1, cut_mark)
-    # 列表整体用 text 围栏包住（用户 2026-10-29 要求）：等宽、整块可复制，
-    # 也不会让钉钉把「1.」当成 markdown 有序列表吃掉缩进。
+        if mark and keep is not None and num == keep:
+            rows.append(mark)
     lines = ["线程会话%d · `%s`" % (n, skey), "", "```text"]
     lines.extend(rows)
-    lines.extend(["```", ""])
-    if total > len(shown):
-        lines.append("只列最近 %d 条，共 %d 条。" % (len(shown), total))
-    # 回退、分叉各自一块 text 围栏：钉钉只有 markdown 模式会渲染围栏，
-    # send_reply 见到围栏就切 --markdown，用户点一下就能整行复制。
-    # 两块必须分开（用户 2026-10-29 要求），复制时不会连成一行。
-    if keep is not None:
-        lines.append("回退到这儿（保留第 %d 条，整行复制）：" % keep)
-        lines.append("```text")
-        lines.append("aa%d /rewind %d" % (n, keep))
-        lines.append("```")
-        lines.append("")
-    lines.append("从这儿分叉（保留第 %d 条，整行复制）："
-                 % (keep if keep is not None else numbered[-1][0]))
-    lines.append("```text")
-    if keep is not None:
-        lines.append("aa%d /fork %s %d" % (n, skey, keep))
-    else:
-        # 只有一条消息：带编号等于整段复制，直接给不带编号的写法
-        lines.append("aa%d /fork %s" % (n, skey))
     lines.append("```")
+    return lines
+
+
+def history_index_thread(conv_id, n, skey, mid, groups):
+    """`aaN /his`：报出线程 N 的会话 key + 我自己发过的消息编号。
+
+    **纯清单**：不插「回退到这儿」、也不附现成命令块。切点标记只在真要用
+    的时候出现——不带编号的 `/rewind`（看默认切点）、带编号的 `/fork`
+    （标出分叉点）。用户 2026-10-29 明确要求把标记从 `/his` 里撤掉。
+    """
+    items = _collect_items(skey)
+    if not items:
+        if history_raw(skey, limit=5):
+            t_reply(n, conv_id, mid,
+                    "线程会话%d 还没有你自己发的消息（`%s`）。"
+                    % (n, skey), groups, "-his-none")
+        else:
+            t_reply(n, conv_id, mid,
+                    "线程会话%d 没读到历史（`%s`）。gateway 忙或 key 不对，"
+                    "稍后再发一次。" % (n, skey), groups, "-his-empty")
+        return
+    numbered, total = _number_items(skey, items)
+    lines = _hist_block(n, skey, numbered)
+    if total > len(numbered):
+        lines += ["", "只列最近 %d 条，共 %d 条。" % (len(numbered), total)]
+    lines += ["",
+              "就地剪回去：`aa%d /rewind <编号>`；另开一份："
+              "`aa%d /fork %s <编号>`。" % (n, n, _short_skey(skey))]
     t_reply(n, conv_id, mid, "\n".join(lines), groups, "-his")
 
 
@@ -541,10 +547,32 @@ def rewind_thread(conv_id, n, skey, arg, mid, groups):
                    % (n, n), groups, "-rewind-busy")
         return
     if not arg:
-        t_reply(n, conv_id, mid,
-                   "用法：`aa%d /rewind <编号>`，把这条及之后的都从上下文里撤掉。"
-                   "先发 `aa%d /his`，列表里那个「⟲ 回退到这儿」就是默认编号。"
-                   % (n, n), groups, "-rewind-usage")
+        # 不给编号 = 先看切点：列表 + 「回退到这儿」标记（用户 2026-10-29
+        # 要求标记只在这里和带编号的 fork 里出现，/his 不再插）。
+        items = _collect_items(skey)
+        if not items:
+            t_reply(n, conv_id, mid,
+                    "线程会话%d 还没有你自己发的消息，没东西可回退。" % n,
+                    groups, "-rewind-empty")
+            return
+        numbered, total = _number_items(skey, items)
+        keep = numbered[-2][0] if len(numbered) >= 2 else None
+        if keep is None:
+            t_reply(n, conv_id, mid,
+                    "线程会话%d 只有一条消息，回退等于清空，没意义。" % n,
+                    groups, "-rewind-usage")
+            return
+        lines = _hist_block(
+            n, skey, numbered, keep=keep,
+            mark="   ⟲ 回退到这儿（保留第 %d 条，撤掉第 %d 条起）"
+                 % (keep, keep + 1))
+        if total > len(numbered):
+            lines += ["", "只列最近 %d 条，共 %d 条。" % (len(numbered), total)]
+        lines += ["", "默认退回这儿（只撤掉最新一条），整行复制：", "```text",
+                  "aa%d /rewind %d" % (n, keep), "```", "",
+                  "想退回别的位置，把末尾编号换成 `aa%d /his` 里的任意一条。"
+                  % n]
+        t_reply(n, conv_id, mid, "\n".join(lines), groups, "-rewind-list")
         return
     index = int(arg)
     item = his_get(skey, index)
@@ -679,6 +707,14 @@ def fork_at_index_thread(conv_id, n, skey, source, index, mid, groups):
         lines.append("")
         lines.append("原会话 `%s` 没动，完整历史还在那里。"
                      % _short_skey(old_key))
+    # 带编号的 fork 才附列表 + 分叉点标记（用户 2026-10-29 要求）：
+    # 让用户一眼看到「从哪条之后切开的」，编号取自新会话自己的前缀。
+    items = _collect_items(info["key"])
+    if items:
+        numbered, _total = _number_items(info["key"], items)
+        lines.append("")
+        lines.extend(_hist_block(n, info["key"], numbered, keep=index,
+                                 mark="   ⟲ 分叉点（第 %d 条之后）" % index))
     t_reply(n, conv_id, mid, "\n".join(lines), groups, "-fork-msg")
 
 
