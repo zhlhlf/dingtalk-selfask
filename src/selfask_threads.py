@@ -283,12 +283,12 @@ def fork_thread(conv_id, n, skey, source, mid, groups):
     """`aaN /fork <会话key>`：把指定会话的上下文复制进线程 N（新会话）。
 
     约束（都是有意的）：
-    - **只往空线程里复制**。网关的 `sessions.create` 对已存在的 key 会替换
-      transcript（返回 previousSessionId），直接覆盖会把线程 N 原来的上下文
-      悄悄弄丢；所以先查目标有没有消息，有就拒绝，让用户换号或先 `/new`。
+    - **目标线程强制重建**：网关的 `sessions.create` 对已存在的 key 会替换
+      transcript（返回 previousSessionId，旧记录进归档）。用户 2026-10-29
+      明确要求「直接强制新建再 fork」，所以不再因为目标有上下文而拒绝；
+      但回执必须说清楚「原有上下文已被替换」，不能静默丢。
+    - 目标线程正在跑时仍然拒绝：换 transcript 会让 monitor 的 runId/历史对不上。
     - **源会话只读**。只把它当 `parentSessionKey`，不 reset、不 push。
-    - 正在跑的线程不 fork：目标线程可能正被 monitor 盯着，换 transcript 会让
-      这一轮的 runId/历史对不上。
     """
     source = (source or "").strip().strip("`'\"")
     if not source:
@@ -315,12 +315,7 @@ def fork_thread(conv_id, n, skey, source, mid, groups):
                    "线程会话%d 查不到状态（%s），这次没 fork。"
                    % (n, (err or "")[:150]), groups, "-fork-fail")
         return
-    if count:
-        send_reply(conv_id, mid,
-                   "线程会话%d 已经有上下文了，`/fork` 只往空线程里复制。"
-                   "换一个没用过的编号（`aa0` 看现状），或先 `aa%d /new` 清空再试。"
-                   % (n, n), groups, "-fork-used")
-        return
+    replaced = bool(count)
 
     scount, serr = history_count(source, limit=1)
     if serr or scount is None:
@@ -349,9 +344,10 @@ def fork_thread(conv_id, n, skey, source, mid, groups):
     log("thread fork n=%d src=%s session=%s"
         % (n, _short_skey(source), (info.get("sessionId") or "")[:12]))
     send_reply(conv_id, mid,
-               "线程会话%d 已新开，已复制 `%s` 的上下文；原会话没动。\n"
+               "线程会话%d 已%s，已复制 `%s` 的上下文；源会话没动。\n"
                "接着发 `aa%d <正文>` 就在这份上下文上继续。"
-               % (n, _short_skey(source), n), groups, "-fork")
+               % (n, "强制新开（原有上下文已替换）" if replaced else "新开",
+                  _short_skey(source), n), groups, "-fork")
 
 
 def _gateway_msg_id(m):

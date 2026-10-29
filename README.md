@@ -18,7 +18,7 @@
 严格匹配、大小写敏感：`aa` 后必须是半角空格或数字。裸 `/xxx`、`aa /xxx`、`aa `、`aa正文`、`AA `、`aa1x` 都不触发。
 
 `/fork` 的三条约束：
-1. 目标线程 N 必须是**空线程**（已有上下文会拒绝，避免网关替换 transcript 时静默丢历史）；换号或先 `aa<N> /new`。
+1. 目标线程 N **强制重建**：已有上下文会被替换（旧 transcript 进归档），回执会明确说「原有上下文已替换」。刚 `/new` 过的线程只留下一条 system `Reset`，按空线程处理。
 2. 线程 N 正在跑时不许 fork。
 3. 源会话按 `parentSessionKey` 只读复制，复制到最后一条完整的助手消息（`forkFrom: "last-completed"`）。
 

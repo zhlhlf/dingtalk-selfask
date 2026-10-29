@@ -275,10 +275,13 @@ def session_fork(parent_skey, child_skey, fork_from="last-completed"):
 
 
 def history_count(skey, limit=200):
-    """数一个会话有多少条消息，返回 (count, err)。查失败时 count 为 None。
+    """数一个会话有多少条**对话**消息，返回 (count, err)。查失败时 count 为 None。
 
     只用来判「目标线程是不是空的」和「源会话是不是真的有东西」，
     不参与正文判定；limit 只是上限，超过也按 limit 算。
+    **system 消息不算**：`sessions.reset` 之后 `chat.history` 会留下一条
+    role=system 的 "Reset" 记录，按总条数算会把刚 `/new` 过的空线程误判成
+    「已经有上下文」，2026-10-29 实测就是这条卡住了 `/fork`。
     """
     rc, out, err = gw_call("chat.history", {"sessionKey": skey, "limit": limit})
     if rc != 0:
@@ -287,7 +290,9 @@ def history_count(skey, limit=200):
         d = json.loads(out)
     except Exception as e:
         return None, "history json fail %r" % e
-    return len(d.get("messages") or []), ""
+    messages = [m for m in (d.get("messages") or [])
+                if (m.get("role") or "") != "system"]
+    return len(messages), ""
 
 
 def question_pending(skey):
