@@ -419,9 +419,9 @@ def history_index_thread(conv_id, n, skey, mid, groups):
     lines = _hist_block(n, skey, numbered)
     if total > len(numbered):
         lines += ["", "只列最近 %d 条，共 %d 条。" % (len(numbered), total)]
-    lines += ["",
-              "就地剪回去：`aa%d /rewind <编号>`；另开一份："
-              "`aa%d /fork %s <编号>`。" % (n, n, _short_skey(skey))]
+    # 命令不在这里复述（用户 2026-10-29 要求 /his 只当清单看）：要看切点和
+    # 可整行复制的两条命令，发不带编号的 /rewind。
+    lines += ["", "要看切点 + 可整行复制的命令：发 `aa%d /rewind`（不带编号）。" % n]
     t_reply(n, conv_id, mid, "\n".join(lines), groups, "-his")
 
 
@@ -568,9 +568,13 @@ def rewind_thread(conv_id, n, skey, arg, mid, groups):
                  % (keep, keep + 1))
         if total > len(numbered):
             lines += ["", "只列最近 %d 条，共 %d 条。" % (len(numbered), total)]
-        lines += ["", "默认退回这儿（只撤掉最新一条），整行复制：", "```text",
-                  "aa%d /rewind %d" % (n, keep), "```", "",
-                  "想退回别的位置，把末尾编号换成 `aa%d /his` 里的任意一条。"
+        # 两条命令各自一块 text 围栏（用户 2026-10-29 要求「单独 plaintext
+        # 方便复制」）：钉钉里点一下就能整行复制，不会把两条连在一起。
+        lines += ["", "退回这儿（就地剪，整行复制）：", "```text",
+                  "aa%d /rewind %d" % (n, keep), "```",
+                  "", "从这儿分叉（另开一份，整行复制）：", "```text",
+                  "aa%d /fork %s %d" % (n, _short_skey(skey), keep), "```",
+                  "", "想换位置，把末尾编号换成 `aa%d /his` 里的任意一条。"
                   % n]
         t_reply(n, conv_id, mid, "\n".join(lines), groups, "-rewind-list")
         return
