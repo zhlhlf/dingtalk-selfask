@@ -22,7 +22,22 @@ from selfask_gateway import (session_state, session_send, session_abort,
                              question_pending, question_resolve,
                              session_fork, history_count, fork_at_message,
                              _msg_text)
-from selfask_dingtalk import send_reply, check_live_health
+from selfask_dingtalk import send_reply as _send_reply, check_live_health
+
+
+def t_reply(n, conv_id, mid, text, groups, tag=""):
+    """所有线程回执的唯一出口：首行必须是「线程会话N」。
+
+    多线程并行时，正文里说「已停下」「跑完了」根本分不清是谁，用户
+    2026-10-29 要求每条回执都把线程号摆在第一行。已经以「线程会话N」
+    开头的文案不再加抬头，免得同一句话出现两遍。
+    """
+    head = "线程会话%d" % n
+    body = text or ""
+    # 用「线程会话N 后面不是数字」判定，否则线程 1 会把「线程会话10 …」认成自己的抬头。
+    if not re.match(r"线程会话%d(?!\d)" % n, body.lstrip()):
+        body = head + "\n\n" + body
+    return _send_reply(conv_id, mid, body, groups, tag)
 
 _slots = threading.Semaphore(MAX_CONCURRENCY)   # 同时在跑的线程数上限
 
@@ -63,11 +78,11 @@ def _run_thread(conv_id, n, question, mid, groups):
     skey = rec.get("key") or thread_key(conv_id, n)
     got = _slots.acquire(blocking=False)
     if not got:
-        send_reply(conv_id, mid,
+        t_reply(n, conv_id, mid,
                    "线程会话%d 排着：同时在跑的线程已到上限 %d 条，空出来就开跑。"
                    % (n, MAX_CONCURRENCY), groups, "-queued")
         _slots.acquire()
-        send_reply(conv_id, mid, "线程会话%d 轮到它了，开始跑。" % n, groups, "-turn")
+        t_reply(n, conv_id, mid, "线程会话%d 轮到它了，开始跑。" % n, groups, "-turn")
 
     started = time.time()
     thread_put(conv_id, n, state="running", started=started, last_msg=question[:200],
@@ -80,7 +95,7 @@ def _run_thread(conv_id, n, question, mid, groups):
         info, err = session_send(skey, UNATTENDED_NOTE + question)
         if not info:
             log("thread send fail n=%d %s" % (n, err))
-            send_reply(conv_id, mid, "线程会话%d 启动失败：%s" % (n, (err or "")[:300]),
+            t_reply(n, conv_id, mid, "线程会话%d 启动失败：%s" % (n, (err or "")[:300]),
                        groups, "-fail")
             thread_put(conv_id, n, state="idle", deliver=False,
                        last_ok=time.time(), status="failed")
@@ -128,7 +143,7 @@ def monitor_thread(conv_id, n, groups, skey, base_ts, started, mid=None,
         q = question_pending(skey)
         if q and thread_get(conv_id, n).get("q_forwarded") != q.get("id"):
             log("question forwarded n=%d id=%s" % (n, q.get("id")))
-            send_reply(conv_id, mid, question_prompt(n, q), groups, "-question")
+            t_reply(n, conv_id, mid, question_prompt(n, q), groups, "-question")
             thread_put(conv_id, n, q_forwarded=q.get("id"),
                        q_deadline=q.get("expiresAtMs") or 0)
         if q:
@@ -154,7 +169,7 @@ def monitor_thread(conv_id, n, groups, skey, base_ts, started, mid=None,
                    % (n, human_dur(TASK_HARD_LIMIT)))
             if tail:
                 msg += "\n\n中断时已有的进展：\n" + tail[:1200]
-            send_reply(conv_id, mid, msg, groups, "-timeout")
+            t_reply(n, conv_id, mid, msg, groups, "-timeout")
             thread_put(conv_id, n, state="idle", deliver=False, last_ok=now,
                        status="timeout", preview=_preview_line(tail))
             return "timeout"
@@ -169,10 +184,10 @@ def monitor_thread(conv_id, n, groups, skey, base_ts, started, mid=None,
             spent = human_dur(now - started)
             if text:
                 log("thread done n=%d in %s" % (n, spent))
-                send_reply(conv_id, mid, text, groups, "-done")
+                t_reply(n, conv_id, mid, text, groups, "-done")
             else:
                 log("thread done n=%d in %s (no text)" % (n, spent))
-                send_reply(conv_id, mid,
+                t_reply(n, conv_id, mid,
                            "线程会话%d 跑完了（%s），但没拿到正文输出。"
                            % (n, spent), groups, "-done-empty")
             thread_put(conv_id, n, state="idle", deliver=False, last_ok=now,
@@ -186,11 +201,11 @@ def monitor_thread(conv_id, n, groups, skey, base_ts, started, mid=None,
             if tail:
                 bits.append("最近输出：" + tail[:300])
             bits.append("要补话就发 `aa%d <正文>`，下一轮工具调用前带上。" % n)
-            send_reply(conv_id, mid, "\n".join(bits), groups, "-progress")
+            t_reply(n, conv_id, mid, "\n".join(bits), groups, "-progress")
 
         # 一直没进入 busy 状态也没有新正文：多半是没起来，别无限等
         if not busy_seen and not fresh_text and elapsed > 180:
-            send_reply(conv_id, mid,
+            t_reply(n, conv_id, mid,
                        "线程会话%d 3 分钟了还没进执行状态，可能没起来。"
                        "发 `aa%d` 看现状，或 `aa ` 重建一条。" % (n, n),
                        groups, "-stale")
@@ -207,11 +222,11 @@ def _deliver_slash_later(conv_id, n, skey, cmd, mid, groups, seen_ids):
     """
     out = await_reply(skey, seen_ids, timeout=240)
     if not out:
-        send_reply(conv_id, mid,
+        t_reply(n, conv_id, mid,
                    "线程会话%d `%s` 执行了，但没拿到回显。" % (n, cmd),
                    groups, "-slash-empty")
         return
-    send_reply(conv_id, mid, out, groups, "-slash")
+    t_reply(n, conv_id, mid, out, groups, "-slash")
 
 
 def slash_thread(conv_id, n, skey, raw, mid, groups):
@@ -256,14 +271,14 @@ def slash_thread(conv_id, n, skey, raw, mid, groups):
     # 不 steer：斜杠命令是在消息入口被解析的，塞进运行中的 run 里不保证生效
     info, err = session_send(skey, raw)
     if not info:
-        send_reply(conv_id, mid,
+        t_reply(n, conv_id, mid,
                    "线程会话%d 执行 `%s` 失败：%s" % (n, cmd, (err or "")[:250]),
                    groups, "-slash-fail")
         return
     log("thread slash n=%d cmd=%s run=%s" % (n, cmd, (info.get("run") or "")[:12]))
 
     if busy:
-        send_reply(conv_id, mid,
+        t_reply(n, conv_id, mid,
                    "线程会话%d 正跑着，`%s` 已提交，等这一轮结束就执行。"
                    % (n, cmd), groups, "-slash-queued")
         # 不能就此 return：命令的回复确实会产生，得有人去收。
@@ -274,12 +289,12 @@ def slash_thread(conv_id, n, skey, raw, mid, groups):
         return
     out = await_reply(skey, seen_ids)
     if not out:
-        send_reply(conv_id, mid,
+        t_reply(n, conv_id, mid,
                    "线程会话%d 已执行 `%s`，没有输出（这条命令本身不返回内容）。"
                    % (n, cmd),
                    groups, "-slash-empty")
         return
-    send_reply(conv_id, mid, out, groups, "-slash")
+    t_reply(n, conv_id, mid, out, groups, "-slash")
 
 
 def _short_skey(skey):
@@ -310,7 +325,7 @@ def history_index_thread(conv_id, n, skey, mid, groups):
     """
     msgs = history_raw(skey, limit=200)
     if not msgs:
-        send_reply(conv_id, mid,
+        t_reply(n, conv_id, mid,
                    "线程会话%d 没读到历史（`%s`）。gateway 忙或 key 不对，"
                    "稍后再发一次。" % (n, skey), groups, "-his-empty")
         return
@@ -324,7 +339,7 @@ def history_index_thread(conv_id, n, skey, mid, groups):
         items.append({"id": _gateway_msg_id(m), "text": text[:200],
                       "at": int(m.get("timestamp") or 0)})
     if not items:
-        send_reply(conv_id, mid,
+        t_reply(n, conv_id, mid,
                    "线程会话%d 还没有你自己发的消息（`%s`）。"
                    % (n, skey), groups, "-his-none")
         return
@@ -345,8 +360,14 @@ def history_index_thread(conv_id, n, skey, mid, groups):
     lines.append("")
     if total > len(shown):
         lines.append("只列最近 %d 条，共 %d 条。" % (len(shown), total))
-    lines.append("从第 n 条之前分叉：`aa%d /fork %s <编号>`" % (n, skey))
-    send_reply(conv_id, mid, "\n".join(lines), groups, "-his")
+    # 分叉命令单独用 text 围栏包起来：钉钉只有 markdown 模式会渲染围栏，
+    # send_reply 见到围栏就切 --markdown，用户点一下就能整行复制。
+    last = numbered[-1][0]
+    lines.append("从第 N 条之前分叉（整行复制，改末尾数字）：")
+    lines.append("```text")
+    lines.append("aa%d /fork %s %d" % (n, skey, last))
+    lines.append("```")
+    t_reply(n, conv_id, mid, "\n".join(lines), groups, "-his")
 
 
 def fork_thread(conv_id, n, skey, arg, mid, groups):
@@ -371,7 +392,7 @@ def fork_thread(conv_id, n, skey, arg, mid, groups):
     source = toks[0] if toks else ""
     index = toks[1] if len(toks) > 1 else ""
     if index and not index.isdigit():
-        send_reply(conv_id, mid,
+        t_reply(n, conv_id, mid,
                    "编号要写数字：`aa%d /fork <会话key> <编号>`。"
                    "先发 `aa%d /his` 拿编号。" % (n, n), groups, "-fork-usage")
         return
@@ -379,14 +400,14 @@ def fork_thread(conv_id, n, skey, arg, mid, groups):
         fork_at_index_thread(conv_id, n, skey, source, int(index), mid, groups)
         return
     if not source:
-        send_reply(conv_id, mid,
+        t_reply(n, conv_id, mid,
                    "用法：`aa%d /fork <会话key>` 整段复制；"
                    "`aa%d /fork <会话key> <编号>` 从某条消息之前分叉"
                    "（编号先发 `/his` 拿）。发 `aa0` 能看到各线程的 key。" % (n, n),
                    groups, "-fork-usage")
         return
     if _same_skey(source, skey):
-        send_reply(conv_id, mid,
+        t_reply(n, conv_id, mid,
                    "线程会话%d 的 key 就是 `%s`，整段复制到自己身上没有意义。"
                    "想回到以前某一条，用 `aa%d /fork %s <编号>`。"
                    % (n, _short_skey(skey), n, _short_skey(skey)),
@@ -394,7 +415,7 @@ def fork_thread(conv_id, n, skey, arg, mid, groups):
         return
     rec = thread_get(conv_id, n)
     if rec.get("state") == "running":
-        send_reply(conv_id, mid,
+        t_reply(n, conv_id, mid,
                    "线程会话%d 正在跑，现在不能 fork（换 transcript 会把这一轮"
                    "的上下文弄乱）。等它结束，或先 `aa%d /new`。" % (n, n),
                    groups, "-fork-busy")
@@ -402,7 +423,7 @@ def fork_thread(conv_id, n, skey, arg, mid, groups):
 
     count, err = history_count(skey, limit=1)
     if err or count is None:
-        send_reply(conv_id, mid,
+        t_reply(n, conv_id, mid,
                    "线程会话%d 查不到状态（%s），这次没 fork。"
                    % (n, (err or "")[:150]), groups, "-fork-fail")
         return
@@ -410,20 +431,20 @@ def fork_thread(conv_id, n, skey, arg, mid, groups):
 
     scount, serr = history_count(source, limit=1)
     if serr or scount is None:
-        send_reply(conv_id, mid,
+        t_reply(n, conv_id, mid,
                    "源会话 `%s` 查不到（%s）。检查 key 是否抄对；`aa0` 里的 key "
                    "可以直接复制。" % (source, (serr or "")[:120]),
                    groups, "-fork-srcfail")
         return
     if not scount:
-        send_reply(conv_id, mid,
+        t_reply(n, conv_id, mid,
                    "源会话 `%s` 没有历史消息（key 不对，或者它本来就是空的）。"
                    "发 `aa0` 核对一下 key。" % source, groups, "-fork-empty")
         return
 
     info, ferr = session_fork(source, skey)
     if not info:
-        send_reply(conv_id, mid,
+        t_reply(n, conv_id, mid,
                    "线程会话%d fork 失败：%s" % (n, (ferr or "")[:250]),
                    groups, "-fork-fail")
         return
@@ -434,7 +455,7 @@ def fork_thread(conv_id, n, skey, arg, mid, groups):
                forked_from=source, q_forwarded=None, q_deadline=0)
     log("thread fork n=%d src=%s session=%s"
         % (n, _short_skey(source), (info.get("sessionId") or "")[:12]))
-    send_reply(conv_id, mid,
+    t_reply(n, conv_id, mid,
                "线程会话%d 已%s，已复制 `%s` 的上下文；源会话没动。\n"
                "接着发 `aa%d <正文>` 就在这份上下文上继续。"
                % (n, "强制新开（原有上下文已替换）" if replaced else "新开",
@@ -451,13 +472,13 @@ def fork_at_index_thread(conv_id, n, skey, source, index, mid, groups):
     rec = thread_get(conv_id, n)
     st, _ = session_state(skey)
     if rec.get("state") == "running" or (st or {}).get("active"):
-        send_reply(conv_id, mid,
+        t_reply(n, conv_id, mid,
                    "线程会话%d 正在跑，现在不能 fork（换会话会把这一轮弄乱）。"
                    "等它结束，或先 `aa%d /stop`。" % (n, n), groups, "-fork-busy")
         return
     item = his_get(source, index)
     if not item:
-        send_reply(conv_id, mid,
+        t_reply(n, conv_id, mid,
                    "没有编号 %d 的记录：先在源会话发 `aaM /his` 看编号，"
                    "编号会记在源会话 key 上（`%s`）。" % (index, _short_skey(source)),
                    groups, "-fork-noidx")
@@ -466,7 +487,7 @@ def fork_at_index_thread(conv_id, n, skey, source, index, mid, groups):
     source = item.get("key") or source
     info, err = fork_at_message(source, item["id"])
     if not info:
-        send_reply(conv_id, mid,
+        t_reply(n, conv_id, mid,
                    "线程会话%d 分叉失败：%s" % (n, (err or "")[:250]),
                    groups, "-fork-fail")
         return
@@ -493,7 +514,7 @@ def fork_at_index_thread(conv_id, n, skey, source, index, mid, groups):
         lines.append("")
         lines.append("原会话 `%s` 没动，完整历史还在那里。"
                      % _short_skey(old_key))
-    send_reply(conv_id, mid, "\n".join(lines), groups, "-fork-msg")
+    t_reply(n, conv_id, mid, "\n".join(lines), groups, "-fork-msg")
 
 
 def _gateway_msg_id(m):
@@ -517,7 +538,7 @@ def reset_thread(conv_id, n, skey, mid, groups):
         time.sleep(2)
     ok, err = session_reset(skey)
     if not ok:
-        send_reply(conv_id, mid,
+        t_reply(n, conv_id, mid,
                    "线程会话%d 重置失败：%s" % (n, err),
                    groups, "-reset-fail")
         return
@@ -529,7 +550,7 @@ def reset_thread(conv_id, n, skey, mid, groups):
            % (n, n))
     if was_active:
         msg += "\n（原来那轮还在跑，我先中断再重置的。）"
-    send_reply(conv_id, mid, msg, groups, "-reset")
+    t_reply(n, conv_id, mid, msg, groups, "-reset")
 
 
 _LETTERS = "ABCDEFGH"
@@ -549,7 +570,7 @@ def stop_thread(conv_id, n, skey, mid, groups):
     """
     ok, method, detail = stop_run(skey)
     if not ok:
-        send_reply(conv_id, mid,
+        t_reply(n, conv_id, mid,
                    "线程会话%d 没停下：%s\n\n"
                    "可以发 `aa%d /new` 强制重置（会清空上下文）。"
                    % (n, detail or "原因不明", n), groups, "-stop-fail")
@@ -557,7 +578,7 @@ def stop_thread(conv_id, n, skey, mid, groups):
     if method == "none":
         rec = thread_get(conv_id, n)
         last = _hhmm(rec.get("last_ok")) if rec.get("last_ok") else "刚才"
-        send_reply(conv_id, mid,
+        t_reply(n, conv_id, mid,
                    "线程会话%d 现在没在跑（上次结束 %s），不用停。"
                    % (n, last), groups, "-stop-idle")
         return
@@ -565,14 +586,14 @@ def stop_thread(conv_id, n, skey, mid, groups):
     thread_put(conv_id, n, state="idle", deliver=False, last_ok=time.time(),
                status="stopped")
     if method == "reset":
-        send_reply(conv_id, mid,
+        t_reply(n, conv_id, mid,
                    "线程会话%d 已停下，但网关拒绝了跨连接中断（unauthorized），"
                    "我走的是重置：**上下文已清空**。\n\n"
                    "接着发 `aa%d <正文>` 是全新一轮。" % (n, n),
                    groups, "-stop-reset")
         return
     log("thread stop n=%d via abort" % n)
-    send_reply(conv_id, mid,
+    t_reply(n, conv_id, mid,
                "线程会话%d 已停下，上下文保留（队列里没开始的补话也一并丢了）。\n\n"
                "接着发 `aa%d <正文>` 就是同一会话的新一轮。" % (n, n),
                groups, "-stop")
@@ -635,7 +656,7 @@ def _answer_pending(conv_id, q, n, text, mid, groups):
         log("question resolve fail id=%s %s" % (q.get("id"), (err or "")[:160]))
         return False, err or "unknown"
     log("question resolved id=%s answers=%s" % (q.get("id"), answers))
-    send_reply(conv_id, mid,
+    t_reply(n, conv_id, mid,
                "线程会话%d 已把这条答复交回问题，继续跑，有结果我再发。" % n,
                groups, "-qanswer")
     return True, ""
@@ -660,7 +681,7 @@ def push_thread(conv_id, n, question, mid, groups):
 
     st, err = session_state(skey)
     if err:
-        send_reply(conv_id, mid,
+        t_reply(n, conv_id, mid,
                    "线程会话%d 查不到状态（%s），这条没发。" % (n, err[:150]),
                    groups, "-fail")
         return
@@ -677,13 +698,13 @@ def push_thread(conv_id, n, question, mid, groups):
             thread_put(conv_id, n, q_forwarded=None, q_deadline=0)
             return
         # 交不上去（过期/已被答/答案不合法）：退回普通 push，别把话吞掉
-        send_reply(conv_id, mid,
+        t_reply(n, conv_id, mid,
                    "线程会话%d 的问题没交上去（%s），按普通消息继续。"
                    % (n, (err or "")[:160]), groups, "-qfail")
 
     info, err2 = session_send(skey, UNATTENDED_NOTE + question, steer=busy)
     if not info:
-        send_reply(conv_id, mid,
+        t_reply(n, conv_id, mid,
                    "线程会话%d push 失败：%s" % (n, (err2 or "")[:300]),
                    groups, "-fail")
         return
@@ -692,7 +713,7 @@ def push_thread(conv_id, n, question, mid, groups):
                        last_push=time.time(), last_msg=question[:200])
         log("thread push n=%d run=%s pushes=%d"
             % (n, (info.get("run") or "")[:12], t.get("pushes") or 0))
-        send_reply(conv_id, mid,
+        t_reply(n, conv_id, mid,
                    "线程会话%d push消息成功（正跑着，这条会在下一次工具调用前带上）。" % n,
                    groups, "-push")
         return
@@ -702,7 +723,7 @@ def push_thread(conv_id, n, question, mid, groups):
     thread_put(conv_id, n, state="running", started=started, base_ts=base_ts,
                deliver=True, last_mid=mid, run=info.get("run") or "",
                last_msg=question[:200], pushes=(rec.get("pushes") or 0) + 1)
-    send_reply(conv_id, mid,
+    t_reply(n, conv_id, mid,
                "线程会话%d 刚才空闲（上次结束 %s），这条没接到运行中的任务上，"
                "我按新一轮开始跑了。" % (n, _hhmm(rec.get("last_ok") or started)),
                groups, "-push-idle")
@@ -726,7 +747,7 @@ def resume_threads(groups):
             st, err = session_state(skey, since_ms=base_ts)
             if st and st["active"]:
                 log("resume: thread n=%d still running" % n)
-                send_reply(conv_id, mid,
+                t_reply(n, conv_id, mid,
                            "守护进程重启过，线程会话%d 还在跑（已 %s），我接着盯。"
                            % (n, human_dur(time.time() - started)),
                            groups, "-reattach")
@@ -737,7 +758,7 @@ def resume_threads(groups):
                 text = (st or {}).get("last") or ""
                 log("resume: thread n=%d finished while down" % n)
                 if text and t.get("deliver"):
-                    send_reply(conv_id, mid, text, groups, "-done")
+                    t_reply(n, conv_id, mid, text, groups, "-done")
                 thread_put(conv_id, n, state="idle", deliver=False,
                            last_ok=time.time(), preview=_preview_line(text))
 

@@ -84,7 +84,10 @@ def send_reply(conv_id, mid, text, groups, tag=""):
         # 正文以 ``` 开头时走 --markdown：钉钉只有 markdown 模式会把围栏渲染成
         # 代码块（text 模式围栏变字面量）。其它正文仍走 --content 纯文本。
         head = "<@%s> %s\n\n" % (SELF_OID, REPLY_MARKER)
-        if (prefix + piece).lstrip().startswith("```"):
+        # 正文里有围栏就走 markdown：围栏不再是「必须在开头」，因为回执首行
+        # 现在固定是「线程会话N」抬头的纯文本，命令块排在后面。
+        probe = prefix + piece
+        if "```" in probe:
             cmd = [DWS_BIN, "chat", "message", "send", "--conversation-id", conv_id,
                    "--at-open-dingtalk-ids", SELF_OID,
                    "--markdown", head + prefix + piece,

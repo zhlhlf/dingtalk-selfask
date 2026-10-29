@@ -144,4 +144,5 @@ RESET_CMDS = ("/new", "/reset", "/clear")
 STOP_CMDS = ("/stop", "/abort")
 
 # `/his` 一次最多列多少条自己的消息（编号仍按全量顺序给）
-HIS_SHOW = 20
+# 2026-10-29 用户要求默认 8 条：够看清最近几轮，又不至于把回执撑得太长。
+HIS_SHOW = 8
