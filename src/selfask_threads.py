@@ -383,26 +383,33 @@ def history_index_thread(conv_id, n, skey, mid, groups):
         stamp = _hhmm(item["at"] / 1000.0) if item["at"] else ""
         rows.append("%d. %s%s" % (num, ("（%s）" % stamp) if stamp else "",
                                   item["text"][:80]))
-    # 列表中间插一个「回退到这儿」的标记：钉在最新一条之前，说明 /rewind 会
-    # 把这条及之后都从上下文里撤掉（用户 2026-10-29 要的可视切点）。
-    # 命令本身不写在这里——它有自己的 text 围栏，别和 /fork 挤在一块。
-    last = numbered[-1][0]
-    cut_mark = "   ⟲ 回退到这儿（第 %d 条之前）" % last
-    rows.insert(len(rows) - 1, cut_mark)
+    # 切点插在两条之间：**保留**上面那条，撤掉下面那条起（用户 2026-10-29
+    # 纠正：选中的编号那条也要保留）。默认钉在最后两条中间，即「撤掉最新
+    # 一条、保留它之前的」。只有 1 条时没有可切的位置，不插标记。
+    keep = numbered[-2][0] if len(numbered) >= 2 else None
+    if keep is not None:
+        cut_mark = "   ⟲ 回退到这儿（保留第 %d 条，撤掉第 %d 条起）" % (keep, keep + 1)
+        rows.insert(len(rows) - 1, cut_mark)
     lines = ["线程会话%d · `%s`" % (n, skey), ""] + rows + [""]
     if total > len(shown):
         lines.append("只列最近 %d 条，共 %d 条。" % (len(shown), total))
     # 回退、分叉各自一块 text 围栏：钉钉只有 markdown 模式会渲染围栏，
     # send_reply 见到围栏就切 --markdown，用户点一下就能整行复制。
     # 两块必须分开（用户 2026-10-29 要求），复制时不会连成一行。
-    lines.append("回退到这儿（整行复制，改末尾数字）：")
+    if keep is not None:
+        lines.append("回退到这儿（保留第 %d 条，整行复制）：" % keep)
+        lines.append("```text")
+        lines.append("aa%d /rewind %d" % (n, keep))
+        lines.append("```")
+        lines.append("")
+    lines.append("从这儿分叉（保留第 %d 条，整行复制）："
+                 % (keep if keep is not None else numbered[-1][0]))
     lines.append("```text")
-    lines.append("aa%d /rewind %d" % (n, last))
-    lines.append("```")
-    lines.append("")
-    lines.append("从第 N 条之前分叉（整行复制，改末尾数字）：")
-    lines.append("```text")
-    lines.append("aa%d /fork %s %d" % (n, skey, last))
+    if keep is not None:
+        lines.append("aa%d /fork %s %d" % (n, skey, keep))
+    else:
+        # 只有一条消息：带编号等于整段复制，直接给不带编号的写法
+        lines.append("aa%d /fork %s" % (n, skey))
     lines.append("```")
     t_reply(n, conv_id, mid, "\n".join(lines), groups, "-his")
 
@@ -542,30 +549,40 @@ def rewind_thread(conv_id, n, skey, arg, mid, groups):
                    "（编号只在生成时有效，之后新消息不会改动它）。"
                    % (index, n), groups, "-rewind-noidx")
         return
-    info, err = rewind_at_message(item.get("key") or skey, item["id"])
+    # 语义：**保留**选中的那条，切在它之后（用户 2026-10-29 纠正：选中编号那条
+    # 不能一起撤掉）。网关只接受在 user 消息「之前」剪，所以真正下刀的是下一条。
+    nxt = his_get(skey, index + 1)
+    if not nxt:
+        t_reply(n, conv_id, mid,
+                   "第 %d 条已经是最后一条，后面没有可撤的消息。"
+                   "想连它一起重来，用 `aa%d /rewind %d`（保留前一条、撤掉它）。"
+                   % (index, n, index - 1 if index > 1 else 1), groups,
+                   "-rewind-last")
+        return
+    info, err = rewind_at_message(item.get("key") or skey, nxt["id"])
     if not info:
         t_reply(n, conv_id, mid,
                    "线程会话%d 回退失败：%s" % (n, (err or "")[:250]),
                    groups, "-rewind-fail")
         return
-    dropped = his_prune(skey, index)
+    dropped = his_prune(skey, index + 1)
     thread_put(conv_id, n, state="idle", started=None, base_ts=0,
                status="rewind", pushes=0, deliver=False, last_ok=time.time(),
                run="", last_msg="rewind@%d" % index, preview="rewind@%d" % index,
                q_forwarded=None, q_deadline=0)
     log("thread rewind n=%d idx=%d dropped=%d key=%s"
         % (n, index, dropped, _short_skey(skey)))
-    cut = _strip_note(info.get("text") or item.get("text") or "")
-    lines = ["线程会话%d 已回退到第 %d 条之前（`%s`）。"
-             % (n, index, _short_skey(info.get("key") or skey)), ""]
+    cut = _strip_note(info.get("text") or nxt.get("text") or "")
+    lines = ["线程会话%d 已回退到第 %d 条之后：保留 #1–#%d，撤掉 #%d 起（`%s`）。"
+             % (n, index, index, index + 1, _short_skey(info.get("key") or skey)),
+             ""]
     if cut:
-        lines.append("撤掉的那条原文：")
+        lines.append("撤掉的第一条原文：")
         lines.append(cut[:400])
         lines.append("")
-    lines.append("现在上下文就停在它前面；改完直接发 `aa%d <正文>`，不想改就继续。"
-                 % n)
+    lines.append("改完直接发 `aa%d <正文>`，不想改就继续。" % n)
     lines.append("提醒：只回退了上下文，**之前跑过的命令、改过的文件还在**；"
-                 "编号 >= %d 的已作废，要重新分叉先 `/his`。" % index)
+                 "编号 >= %d 的已作废，要重新分叉先 `/his`。" % (index + 1))
     t_reply(n, conv_id, mid, "\n".join(lines), groups, "-rewind")
 
 
@@ -590,9 +607,19 @@ def fork_at_index_thread(conv_id, n, skey, source, index, mid, groups):
                    "编号会记在源会话 key 上（`%s`）。" % (index, _short_skey(source)),
                    groups, "-fork-noidx")
         return
+    # 语义：**保留**选中的那条，切在它之后（与 /rewind 对齐，用户 2026-10-29
+    # 纠正「选择的编号那条也要保留」）。网关只能在 user 消息之前剪，所以真正
+    # 下刀的是下一条 user 消息。
+    nxt = his_get(source, index + 1)
+    if not nxt:
+        t_reply(n, conv_id, mid,
+                   "第 %d 条已经是最后一条，分叉等于整段复制。"
+                   "用 `aa%d /fork %s`（不带编号）即可。"
+                   % (index, n, _short_skey(source)), groups, "-fork-last")
+        return
     # 编号表里记着完整 key：用户只抄短 key 也能分叉
     source = item.get("key") or source
-    info, err = fork_at_message(source, item["id"])
+    info, err = fork_at_message(source, nxt["id"])
     if not info:
         t_reply(n, conv_id, mid,
                    "线程会话%d 分叉失败：%s" % (n, (err or "")[:250]),
@@ -607,16 +634,15 @@ def fork_at_index_thread(conv_id, n, skey, source, index, mid, groups):
                forked_from=source, q_forwarded=None, q_deadline=0)
     log("thread fork@msg n=%d src=%s idx=%d -> %s"
         % (n, _short_skey(source), index, _short_skey(info["key"])))
-    lines = ["线程会话%d 已从 `%s` 的第 %d 条之前分叉，"
-             "线程现在指向 `%s`。" % (n, _short_skey(source), index,
+    lines = ["线程会话%d 已从 `%s` 的第 %d 条之后分叉：保留 #1–#%d，"
+             "线程现在指向 `%s`。" % (n, _short_skey(source), index, index,
                                       _short_skey(info["key"])), ""]
-    cut = _strip_note(info.get("text") or item.get("text") or "")
+    cut = _strip_note(info.get("text") or nxt.get("text") or "")
     if cut:
-        lines.append("被切出来的那条原文：")
+        lines.append("被切出来的第一条原文：")
         lines.append(cut[:400])
         lines.append("")
-    lines.append("接着发 `aa%d <正文>` 就停在那条之前，改完再发；"
-                 "不想改就直接继续。" % n)
+    lines.append("接着发 `aa%d <正文>` 就从这儿往下写；不想改就直接继续。" % n)
     if not _same_skey(old_key, info["key"]):
         lines.append("")
         lines.append("原会话 `%s` 没动，完整历史还在那里。"
