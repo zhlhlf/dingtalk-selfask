@@ -137,3 +137,8 @@ PING_RE = re.compile(
 
 # reset 家族：走 chat.send 会被网关拒（不是这个会话的 owner），必须改用 sessions.reset
 RESET_CMDS = ("/new", "/reset", "/clear")
+
+# stop 家族：走 chat.send 会被网关的斜杠层用「发起 chat.send 的那条连接」做
+# owner 校验，而本守护每次都是新的 gateway call 短连接 → 恒返回 unauthorized
+# （2026-10-29 用户实测）。本地拦下、直接调 sessions.abort 才停得下来。
+STOP_CMDS = ("/stop", "/abort")

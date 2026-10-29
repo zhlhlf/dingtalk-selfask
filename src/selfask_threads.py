@@ -11,12 +11,13 @@ import threading
 import time
 
 from selfask_config import (TASK_HARD_LIMIT, PROGRESS_EVERY, POLL_INTERVAL,
-                            MAX_CONCURRENCY, UNATTENDED_NOTE, RESET_CMDS)
+                            MAX_CONCURRENCY, UNATTENDED_NOTE, RESET_CMDS,
+                            STOP_CMDS)
 from selfask_util import log, human_dur, _hhmm
 from selfask_state import (thread_get, thread_put, thread_ensure, thread_alloc,
                            conv_threads, thread_key, threads_snapshot)
 from selfask_gateway import (session_state, session_send, session_abort,
-                             session_reset, history_raw, await_reply,
+                             session_reset, stop_run, history_raw, await_reply,
                              question_pending, question_resolve,
                              session_fork, history_count)
 from selfask_dingtalk import send_reply, check_live_health
@@ -221,8 +222,12 @@ def slash_thread(conv_id, n, skey, raw, mid, groups):
     位于整条消息开头才被识别，加了前缀就退化成普通对话内容（`aa1 /new` 连发
     三次都没重置，就是这么来的）。
 
-    唯一例外是 reset 家族：`/new` 走 chat.send 会被网关拒（不是这个会话的
-    owner），必须改用 sessions.reset。这个例外有实测依据，不是猜的。
+    例外有两族（都有实测依据，不是猜的）：
+    - reset 家族：`/new` 走 chat.send 会被网关拒（不是这个会话的 owner），
+      必须改用 sessions.reset；
+    - stop 家族：`/stop` 交给网关的斜杠层同样会 `unauthorized`（斜杠层拿
+      发起 chat.send 的那条连接当 owner，我们是每次新短连接）。本地直接调
+      `sessions.abort` 才停得下来，详见 `stop_thread`。
     """
     parts = raw.strip().split(None, 1)
     cmd = parts[0].lower()
@@ -231,6 +236,9 @@ def slash_thread(conv_id, n, skey, raw, mid, groups):
     if cmd == "/fork":
         fork_thread(conv_id, n, skey, parts[1] if len(parts) > 1 else "",
                     mid, groups)
+        return
+    if cmd in STOP_CMDS:
+        stop_thread(conv_id, n, skey, mid, groups)
         return
     if cmd in RESET_CMDS:
         reset_thread(conv_id, n, skey, mid, groups)
@@ -387,6 +395,49 @@ def reset_thread(conv_id, n, skey, mid, groups):
 
 
 _LETTERS = "ABCDEFGH"
+
+
+def stop_thread(conv_id, n, skey, mid, groups):
+    """`aaN /stop`：本地打断线程 N 的这一轮，不交给网关的斜杠层。
+
+    为什么不能裸发：网关的 `/stop` 斜杠命令用「发起 chat.send 的那条连接」
+    做 owner 校验（ownerConnId 比对），而本守护每次 `gateway call` 都是新的
+    短连接 → 恒定 `unauthorized`（2026-10-29 用户 19:27 实测，用户看到的就是
+    「线程会话N 执行 /stop 失败：unauthorized」）。本地调 `sessions.abort`
+    走 CLI 的 admin 作用域，owner 校验被跳过，才真停得下来且**不丢上下文**。
+
+    只有当 abort 仍被拒时才会退化成 reset（那才会清空上下文），回执必须把
+    这个代价写清楚，不许含糊成「已停止」。
+    """
+    ok, method, detail = stop_run(skey)
+    if not ok:
+        send_reply(conv_id, mid,
+                   "线程会话%d 没停下：%s\n\n"
+                   "可以发 `aa%d /new` 强制重置（会清空上下文）。"
+                   % (n, detail or "原因不明", n), groups, "-stop-fail")
+        return
+    if method == "none":
+        rec = thread_get(conv_id, n)
+        last = _hhmm(rec.get("last_ok")) if rec.get("last_ok") else "刚才"
+        send_reply(conv_id, mid,
+                   "线程会话%d 现在没在跑（上次结束 %s），不用停。"
+                   % (n, last), groups, "-stop-idle")
+        return
+    # 无论走哪条路，这一轮的运行账都要清，否则 monitor 会拿旧 runId 继续盯
+    thread_put(conv_id, n, state="idle", deliver=False, last_ok=time.time(),
+               status="stopped")
+    if method == "reset":
+        send_reply(conv_id, mid,
+                   "线程会话%d 已停下，但网关拒绝了跨连接中断（unauthorized），"
+                   "我走的是重置：**上下文已清空**。\n\n"
+                   "接着发 `aa%d <正文>` 是全新一轮。" % (n, n),
+                   groups, "-stop-reset")
+        return
+    log("thread stop n=%d via abort" % n)
+    send_reply(conv_id, mid,
+               "线程会话%d 已停下，上下文保留（队列里没开始的补话也一并丢了）。\n\n"
+               "接着发 `aa%d <正文>` 就是同一会话的新一轮。" % (n, n),
+               groups, "-stop")
 
 
 def question_prompt(n, q):

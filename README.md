@@ -178,7 +178,7 @@ send_reply → dws chat message send（群：--conversation-id + @占位符；�
 
 - 所有 `/xxx` 都直接、裸发给 Gateway，避免无人维护命令白名单；不带 `aa<N>` 的 slash 落到本会话最近在用的线程。
 - `/new`、`/reset`、`/clear` 是例外：`chat.send` 不能重置非当前 owner 的会话，脚本改走 `sessions.reset`。若该线程在跑，先尝试中断。
-- 硬超时的中断先调用 `sessions.abort`；CLI 的连接不是 run owner 而收到 `unauthorized` 时，自动以 `sessions.reset` 兜底，真正停掉 run，但会清空这个线程的上下文。
+- 中断统一走 `stop_run()`：先 `sessions.abort`（CLI 在 loopback + token 下对 abort 类方法申请 `operator.admin`，能跳过 owner 校验，**上下文保留**）；仍被拒才降级 `sessions.reset`（上下文清空）。`aa<N> /stop`、`/abort` 本地拦下走这条路，**不裸发**给网关斜杠层（裸发恒定 `unauthorized`）。
 
 ### 为什么不用 `openclaw agent --session-key` 做 push
 

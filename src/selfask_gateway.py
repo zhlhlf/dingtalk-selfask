@@ -200,31 +200,54 @@ def session_send(skey, message, steer=False, idem=None):
     return {"run": d.get("runId") or "", "status": d.get("status") or ""}, None
 
 
+def stop_run(skey, clear_queued=True):
+    """停掉一个正在跑的 run，返回 (ok, method, detail)。
+
+    method：
+      "none"  —— 查下来没有活跃 run，什么都没做
+      "abort" —— `sessions.abort` 真停下了，**上下文保留**
+      "reset" —— 被拒（非 owner），兜底 `sessions.reset` 停下，**上下文清空**
+
+    为什么本地调 `sessions.abort` 能成、把 `/stop` 交给网关的斜杠层却不行：
+    网关的 `/stop` 用的是「发起 chat.send 那条连接」当 owner，而本守护每次
+    都是新的 `gateway call` 短连接，owner 对不上 → 恒定 unauthorized
+    （2026-10-29 用户 19:27 实测就是这个）。而 CLI 在 loopback + 本机 token
+    下对 abort 类方法会请求 `operator.admin` 作用域，admin 直接跳过 owner
+    校验（`canRequesterAbortChatRun` 里 `if (requester.isAdmin) return true`）
+    ——所以同一台机器上直接发 RPC 反而停得下来。
+
+    `clearQueued` 与网关 `/stop` 的行为对齐：key-only 的中断会连带丢掉这个
+    会话排队的补话，否则刚停下又会被队列里的一条重新拉起。
+    """
+    st, err = session_state(skey)
+    if st is not None and not st.get("active"):
+        return True, "none", ""
+    params = {"key": skey}
+    if clear_queued:
+        params["clearQueued"] = True
+    rc, out, err2 = gw_call("sessions.abort", params, timeout=45)
+    blob = (out or "") + (err2 or "")
+    if rc == 0 and _ok_blob(out):
+        log("abort key=%s via sessions.abort" % skey[-12:])
+        return True, "abort", ""
+    if "unauthorized" not in blob.lower():
+        log("abort key=%s rc=%s %s" % (skey[-12:], rc, blob[-160:]))
+        return False, "abort", (err2 or out or "")[:200]
+    log("abort key=%s 授权被拒（非 owner），改用 reset 停 run" % skey[-12:])
+    rc2, out2, err3 = gw_call("sessions.reset", {"key": skey}, timeout=60)
+    ok = rc2 == 0 and _ok_blob(out2)
+    log("abort key=%s reset rc=%s ok=%s" % (skey[-12:], rc2, ok))
+    if not ok:
+        return False, "reset", (err3 or out2 or "")[:200]
+    return True, "reset", ""
+
+
 def session_abort(skey):
     """中断一个正在跑的 run，返回 True/False（真停下来了没有）。
 
-    `sessions.abort` / `chat.abort` 都要求「请求者就是这个 run 的 owner」
-    （ownerDeviceId / ownerConnId 比对）。我们用 CLI 起 run、CLI 再发 abort，
-    两次是不同的连接，owner 对不上 → 恒定返回 unauthorized。2026-10-23 实测
-    两个方法都是这个结果，也就是说**过去的超时中断从未真正停下任务**：
-    只打了行日志、把线程标成 idle，run 还在后台继续烧。
-
-    兜底走 `sessions.reset`：它没有 owner 限制（实测 rc=0），而且重置会连带
-    停掉该会话的活跃 run（实测 3 秒内 hasActiveRun 由 true 变 false）。
-    代价是上下文被清空——只在这条路上用，因为任务已经跑到硬上限了。
+    监控线程超时中断用；细节（真中断 / 走了重置）交给 `stop_run`。
     """
-    rc, out, err = gw_call("sessions.abort", {"key": skey}, timeout=45)
-    blob = (out or "") + (err or "")
-    if rc == 0 and _ok_blob(out):
-        log("abort key=%s via sessions.abort" % skey[-12:])
-        return True
-    if "unauthorized" not in blob.lower():
-        log("abort key=%s rc=%s %s" % (skey[-12:], rc, blob[-160:]))
-        return False
-    log("abort key=%s 授权被拒（非 owner），改用 reset 停 run" % skey[-12:])
-    rc2, out2, err2 = gw_call("sessions.reset", {"key": skey}, timeout=60)
-    ok = rc2 == 0 and _ok_blob(out2)
-    log("abort key=%s reset rc=%s ok=%s" % (skey[-12:], rc2, ok))
+    ok, _method, _detail = stop_run(skey)
     return ok
 
 
