@@ -419,9 +419,20 @@ def history_index_thread(conv_id, n, skey, mid, groups):
     lines = _hist_block(n, skey, numbered)
     if total > len(numbered):
         lines += ["", "只列最近 %d 条，共 %d 条。" % (len(numbered), total)]
-    # 命令不在这里复述（用户 2026-10-29 要求 /his 只当清单看）：要看切点和
-    # 可整行复制的两条命令，发不带编号的 /rewind。
-    lines += ["", "要看切点 + 可整行复制的命令：发 `aa%d /rewind`（不带编号）。" % n]
+    # 两条命令各自一块 text 围栏（用户 2026-10-29 两次要求「单独 plaintext
+    # 方便复制」）：整条消息里有围栏就整体走 --markdown，钉钉才会渲染成代码块。
+    # 列表里**不插**「⟲ 回退到这儿」（那个只在 /rewind 与带编号的 fork 里出现）。
+    keep = numbered[-2][0] if len(numbered) >= 2 else None
+    lines.append("")
+    if keep is not None:
+        lines += ["就地剪回去（整行复制）：", "```text",
+                  "aa%d /rewind %d" % (n, keep), "```", ""]
+    lines += ["另开一份（整行复制）：", "```text"]
+    if keep is not None:
+        lines.append("aa%d /fork %s %d" % (n, _short_skey(skey), keep))
+    else:
+        lines.append("aa%d /fork %s" % (n, _short_skey(skey)))
+    lines.append("```")
     t_reply(n, conv_id, mid, "\n".join(lines), groups, "-his")
 
 
