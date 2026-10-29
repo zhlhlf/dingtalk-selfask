@@ -14,7 +14,7 @@ from selfask_config import THREADS, THREAD_PREFIX, STATE
 
 HIS = os.path.join(os.path.dirname(THREADS), "his_index.json")
 HIS_MAX_KEYS = 20
-HIS_MAX_ITEMS = 200
+HIS_MAX_ITEMS = 500
 _his_lock = threading.Lock()
 
 

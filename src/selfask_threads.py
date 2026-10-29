@@ -316,6 +316,25 @@ def _his_text(m):
     return text
 
 
+def _strip_note(text):
+    """剥掉无人值守前缀，保留正文换行（fork 回显原文时用）。
+
+    `/his` 自己走 `_his_text` 已经把前缀去掉了，但 `/fork` 回显的是网关
+    返回的 `editorText`，是**原始**消息，还带着 `[无人值守] …` 那段。用户
+    2026-10-29 实测看到两边不一致，所以这里统一剥一遍。
+    """
+    body = (text or "").strip()
+    note = UNATTENDED_NOTE.strip()
+    if body.startswith(note):
+        return body[len(note):].lstrip()
+    if body.startswith("[无人值守]"):
+        # 前缀措辞改过时退化处理：丢掉开头的提示段（到第一个空行）
+        parts = body.split("\n\n", 1)
+        if len(parts) == 2 and parts[1].strip():
+            return parts[1].lstrip()
+    return body
+
+
 def history_index_thread(conv_id, n, skey, mid, groups):
     """`aaN /his`：报出线程 N 的会话 key + 我自己发过的消息（带编号）。
 
@@ -323,7 +342,7 @@ def history_index_thread(conv_id, n, skey, mid, groups):
     （网关 `sessions.fork` 也只接受 user entry）。编号在生成时就把 entry id
     钉进 `his_index.json`：之后会话又多了几条消息，按当前历史重新数会指错。
     """
-    msgs = history_raw(skey, limit=200)
+    msgs = history_raw(skey, limit=500)
     if not msgs:
         t_reply(n, conv_id, mid,
                    "线程会话%d 没读到历史（`%s`）。gateway 忙或 key 不对，"
@@ -344,7 +363,8 @@ def history_index_thread(conv_id, n, skey, mid, groups):
                    % (n, skey), groups, "-his-none")
         return
     total = len(items)
-    shown = items[-HIS_SHOW:]
+    # HIS_SHOW<=0 表示全列：用户 2026-10-29 明确要求「列表默认展示全部」。
+    shown = items if HIS_SHOW <= 0 else items[-HIS_SHOW:]
     numbered = []
     for i, item in enumerate(shown):
         num = total - len(shown) + i + 1
@@ -503,7 +523,7 @@ def fork_at_index_thread(conv_id, n, skey, source, index, mid, groups):
     lines = ["线程会话%d 已从 `%s` 的第 %d 条之前分叉，"
              "线程现在指向 `%s`。" % (n, _short_skey(source), index,
                                       _short_skey(info["key"])), ""]
-    cut = (info.get("text") or item.get("text") or "").strip()
+    cut = _strip_note(info.get("text") or item.get("text") or "")
     if cut:
         lines.append("被切出来的那条原文：")
         lines.append(cut[:400])
