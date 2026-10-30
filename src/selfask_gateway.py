@@ -449,6 +449,49 @@ def history_raw(skey, limit=60):
         return []
 
 
+def history_all(skey, limit=1000, max_pages=8):
+    """读整个**活跃分支**的历史，按时间正序返回 (messages, complete)。
+
+    为什么不能只用一次 `chat.history`：不带 offset 它只给**最新**一段，且按
+    字节截断（实测 limit=1000 只回 199 条），所以「全量编号」必须靠 offset
+    翻页。实测语义：offset=0 是最新一页（页内正序、最后一页内含最新消息），
+    `nextOffset` 往更早走，`hasMore=false` 才到底——所以拼的时候要**反序**。
+
+    complete=False 表示翻到页数上限（或中途某页读失败）还没读完，调用方
+    必须退化成窗口编号，不能拿半截列表当全量（否则编号又会漂）。
+    第一页就失败才返回 ([], False)——那时连最近的消息都没有，只能当读不到。
+    """
+    pages = []
+    offset = 0
+
+    def _join():
+        out = []
+        for page in reversed(pages):
+            out.extend(page)
+        return out
+
+    for _ in range(max_pages):
+        rc, out, _err = gw_call("chat.history",
+                                {"sessionKey": skey, "limit": limit, "offset": offset},
+                                timeout=60)
+        d = None
+        if rc == 0:
+            try:
+                d = json.loads(out)
+            except Exception:
+                d = None
+        if d is None:
+            # 中途某页失败：已翻到的部分仍然可用（编号会漂，所以标成不完整）
+            return _join(), False
+        msgs = d.get("messages") or []
+        pages.append(msgs)
+        nxt = d.get("nextOffset")
+        if not d.get("hasMore") or not nxt or not msgs or int(nxt) <= offset:
+            return _join(), True
+        offset = int(nxt)
+    return _join(), False
+
+
 def await_reply(skey, seen_ids, timeout=45):
     """等一个斜杠命令的回复。
 

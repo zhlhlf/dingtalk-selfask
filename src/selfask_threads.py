@@ -21,7 +21,7 @@ from selfask_gateway import (session_state, session_send, session_abort,
                              session_reset, stop_run, history_raw, await_reply,
                              question_pending, question_resolve,
                              session_fork, history_count, fork_at_message,
-                             rewind_at_message, _msg_text)
+                             rewind_at_message, history_all, _msg_text)
 from selfask_dingtalk import send_reply as _send_reply, check_live_health
 
 
@@ -346,9 +346,31 @@ def _collect_items(skey):
 
     只收 role=user：`sessions.fork` 的切点必须是 user entry，编号表也只该
     包含能当切点的消息。
+
+    返回 (items, complete)。`complete=True` 时 items 是**整个活跃分支**的
+    用户消息，编号 = 真实序号，rewind 前后不会变；否则只拿到最新几页，
+    调用方必须退化成窗口编号（`with_all` 保留给需要明确区分的地方）。
+    **不能只用一次 `chat.history`**：实测 limit=500 也只回最新 ~199 条，
+    编号会随窗口滑动重排——用户 2026-10-30 就是被这个坑到（/rewind 2
+    报「撤掉 #3」，随后 /his 又列出 5 条、编号全变，看着像没生效）。
     """
+    msgs, complete = history_all(skey)
     items = []
-    for m in history_raw(skey, limit=500) or []:
+    for m in msgs:
+        if (m.get("role") or "") != "user":
+            continue
+        text = _his_text(m)
+        if not text:
+            continue
+        items.append({"id": _gateway_msg_id(m), "text": text[:200],
+                      "at": int(m.get("timestamp") or 0)})
+    return items, complete
+
+
+def _tail_items(skey):
+    """只读最新一页的用户消息（rewind 后复核用，别为此翻全量历史）。"""
+    items = []
+    for m in history_raw(skey, limit=1000) or []:
         if (m.get("role") or "") != "user":
             continue
         text = _his_text(m)
@@ -360,16 +382,20 @@ def _collect_items(skey):
 
 
 def _number_items(skey, items):
-    """给最近 HIS_SHOW 条编上全量序号，并把 entry id 钉进 his_index.json。
+    """给最近 HIS_SHOW 条编上**全量序号**，并把 entry id 钉进 his_index.json。
 
+    items 是整条活跃分支的用户消息（`_collect_items` 翻页拿全），所以
+    `num = i + 1` 就是真实序号：rewind 之后剩下的仍是 #1–#n，不会因为
+    窗口滑动重新从 1 开始。HIS_SHOW<=0 表示全列。
     编号在这里落盘（而不是用的时候现数）：用户可能隔几分钟才 `/fork`，
-    期间历史增长会重新数错。HIS_SHOW<=0 表示全列。
+    期间历史增长会重新数错。
     """
     total = len(items)
     shown = items if HIS_SHOW <= 0 else items[-HIS_SHOW:]
+    start = total - len(shown)
     numbered = []
     for i, item in enumerate(shown):
-        num = total - len(shown) + i + 1
+        num = start + i + 1
         item["n"] = num
         numbered.append((num, item))
     his_put(skey, [{"n": it["n"], "id": it["id"], "text": it["text"], "at": it["at"]}
@@ -404,7 +430,7 @@ def history_index_thread(conv_id, n, skey, mid, groups):
     的时候出现——不带编号的 `/rewind`（看默认切点）、带编号的 `/fork`
     （标出分叉点）。用户 2026-10-29 明确要求把标记从 `/his` 里撤掉。
     """
-    items = _collect_items(skey)
+    items, complete = _collect_items(skey)
     if not items:
         if history_raw(skey, limit=5):
             t_reply(n, conv_id, mid,
@@ -418,7 +444,10 @@ def history_index_thread(conv_id, n, skey, mid, groups):
     numbered, total = _number_items(skey, items)
     lines = _hist_block(n, skey, numbered)
     if total > len(numbered):
-        lines += ["", "只列最近 %d 条，共 %d 条。" % (len(numbered), total)]
+        lines += ["", "共 %d 条，只列最近 %d 条（编号是全量序号）。"
+                  % (total, len(numbered))]
+    if not complete:
+        lines += ["", "注：历史太长没读全，这次编号只覆盖最近读到的部分。"]
     # 两条命令各自一块 text 围栏（用户 2026-10-29 两次要求「单独 plaintext
     # 方便复制」）：整条消息里有围栏就整体走 --markdown，钉钉才会渲染成代码块。
     # 列表里**不插**「⟲ 回退到这儿」（那个只在 /rewind 与带编号的 fork 里出现）。
@@ -536,9 +565,14 @@ def rewind_thread(conv_id, n, skey, arg, mid, groups):
     - `/rewind <n>` 是**就地剪回去**（key 不变），被撤掉的那条原文由网关从
       editorText 回给我们，改完直接发就能重来。
 
-    编号来自线程自己的 `aaN /his`（entry id 已在生成时钉死）。回退后 >= 编号
-    的 entry 都不在活跃分支上了，所以顺手把那些编号从表里删掉，避免下次
-    `/fork <key> <旧编号>` 撞 `off-active-path`。
+    编号来自线程自己的 `aaN /his`，是**全量序号**（整条活跃分支第几条用户
+    消息），所以回退前后编号不会漂。回退后 >= 编号的 entry 都不在活跃分支
+    上了，顺手把那些编号从表里删掉，避免下次 `/fork <key> <旧编号>` 撞
+    `off-active-path`。
+
+    回执必须把「撤掉了几条、分别是哪几条」列出来（2026-10-30 用户报的 bug：
+    只回一句「已回退到第 N 条之后」，而 /his 又按滑动的窗口重新编号，
+    看着像什么都没发生）。
 
     注意：rewind 只动上下文，**撤不掉工具副作用**（已经改的文件、跑掉的命令
     都还在），回执里要说清。
@@ -560,7 +594,7 @@ def rewind_thread(conv_id, n, skey, arg, mid, groups):
     if not arg:
         # 不给编号 = 先看切点：列表 + 「回退到这儿」标记（用户 2026-10-29
         # 要求标记只在这里和带编号的 fork 里出现，/his 不再插）。
-        items = _collect_items(skey)
+        items, complete = _collect_items(skey)
         if not items:
             t_reply(n, conv_id, mid,
                     "线程会话%d 还没有你自己发的消息，没东西可回退。" % n,
@@ -578,7 +612,10 @@ def rewind_thread(conv_id, n, skey, arg, mid, groups):
             mark="   ⟲ 回退到这儿（保留第 %d 条，撤掉第 %d 条起）"
                  % (keep, keep + 1))
         if total > len(numbered):
-            lines += ["", "只列最近 %d 条，共 %d 条。" % (len(numbered), total)]
+            lines += ["", "共 %d 条，只列最近 %d 条（编号是全量序号）。"
+                      % (total, len(numbered))]
+        if not complete:
+            lines += ["", "注：历史太长没读全，这次编号只覆盖最近读到的部分。"]
         # 两条命令各自一块 text 围栏（用户 2026-10-29 要求「单独 plaintext
         # 方便复制」）：钉钉里点一下就能整行复制，不会把两条连在一起。
         lines += ["", "退回这儿（就地剪，整行复制）：", "```text",
@@ -590,34 +627,86 @@ def rewind_thread(conv_id, n, skey, arg, mid, groups):
         t_reply(n, conv_id, mid, "\n".join(lines), groups, "-rewind-list")
         return
     index = int(arg)
-    item = his_get(skey, index)
-    if not item:
-        t_reply(n, conv_id, mid,
-                   "没有编号 %d 的记录：先发 `aa%d /his` 生成编号表"
-                   "（编号只在生成时有效，之后新消息不会改动它）。"
-                   % (index, n), groups, "-rewind-noidx")
-        return
-    # 语义：**保留**选中的那条，切在它之后（用户 2026-10-29 纠正：选中编号那条
-    # 不能一起撤掉）。网关只接受在 user 消息「之前」剪，所以真正下刀的是下一条。
-    nxt = his_get(skey, index + 1)
-    if not nxt:
-        t_reply(n, conv_id, mid,
-                   "第 %d 条已经是最后一条，后面没有可撤的消息。"
-                   "想连它一起重来，用 `aa%d /rewind %d`（保留前一条、撤掉它）。"
-                   % (index, n, index - 1 if index > 1 else 1), groups,
-                   "-rewind-last")
-        return
+    items, complete = _collect_items(skey)
+    expected = his_get(skey, index)
+    item = None
+    nxt = None
+    resolved = index
+    if complete and items:
+        # 编号是全量序号，但 /his 之后历史可能变过（新消息、或换过分支），
+        # 所以先在**当前**列表里按 his_index 钉的 entry id 找；找不到再退
+        # 「同序号 + 同正文」。都对不上就让用户重发 /his，绝不按错位置下刀。
+        if expected and expected.get("id"):
+            for j, it in enumerate(items):
+                if it["id"] == expected["id"]:
+                    resolved = j + 1
+                    break
+        if not (1 <= resolved <= len(items)):
+            t_reply(n, conv_id, mid,
+                    "第 %d 条超出当前历史（共 %d 条）。先发 `aa%d /his` 看看。"
+                    % (index, len(items), n), groups, "-rewind-noidx")
+            return
+        if (resolved == index and expected
+                and (expected.get("text") or "")[:200] != items[index - 1]["text"]):
+            t_reply(n, conv_id, mid,
+                    "第 %d 条现在不是 `/his` 里那条了（会话在 /his 之后变过）。"
+                    "先发 `aa%d /his` 重新看编号，再按新编号回退。"
+                    % (index, n), groups, "-rewind-stale")
+            return
+        item = items[resolved - 1]
+        dropped_items = items[resolved:]
+        if not dropped_items:
+            t_reply(n, conv_id, mid,
+                    "第 %d 条已经是最后一条，后面没有可撤的消息。"
+                    "想连它一起重来，用 `aa%d /rewind %d`（保留前一条、撤掉它）。"
+                    % (resolved, n, resolved - 1 if resolved > 1 else 1),
+                    groups, "-rewind-last")
+            return
+        nxt = dropped_items[0]
+    else:
+        # 历史太长没读全，或这次压根没读到：退回「按 his_index 钉的 id 切」
+        # 的老路（id 是 /his 当时落盘的，仍然可用），编号只能当窗口序号。
+        if not expected:
+            t_reply(n, conv_id, mid,
+                    ("线程会话%d 读不到历史（gateway 忙或 key 不对），"
+                     "也没有编号 %d 的记录；稍后再发一次，或先 `aa%d /his`。"
+                     % (n, index, n)) if not items else
+                    ("没有编号 %d 的记录：先发 `aa%d /his` 生成编号表"
+                     "（编号只在生成时有效，之后新消息不会改动它）。"
+                     % (index, n)), groups, "-rewind-noidx")
+            return
+        item = expected
+        nxt = his_get(skey, index + 1)
+        if not nxt:
+            t_reply(n, conv_id, mid,
+                    "第 %d 条已经是最后一条，后面没有可撤的消息。"
+                    "想连它一起重来，用 `aa%d /rewind %d`（保留前一条、撤掉它）。"
+                    % (index, n, index - 1 if index > 1 else 1), groups,
+                    "-rewind-last")
+            return
+        dropped_items = []
+        resolved = index
     info, err = rewind_at_message(item.get("key") or skey, nxt["id"])
     if not info:
         t_reply(n, conv_id, mid,
                    "线程会话%d 回退失败：%s" % (n, (err or "")[:250]),
                    groups, "-rewind-fail")
         return
-    # 网关说成功不等于真的剪了：实测这条会话（多 session window 的长会话）
-    # 上 sessions.rewind 只新开了个窗口把历史整段复制过来，一条都没裁。
-    # 所以按 id 复核——被撤的那条还在，就走「分叉到同一位置」这条兜底路。
+    # 网关说成功不等于真的剪了：2026-10-30 实测长会话上 sessions.rewind
+    # 会新开一个 window 把历史整段复制过来，一条都没裁。所以**按结果复核**：
+    # 剪完的列表必须正好是「保留到第 n 条」，最后一条 id 就是选中的那条。
+    # 只查「被撤的那条还在不在」不够——分支切换也会让那条 id 消失，
+    # 看起来像成功、实际换了另一条分支。
+    tail = _tail_items(skey)
+    dropped_ids = {it["id"] for it in dropped_items}
+    # True=复核通过 / False=明显没生效 / None=这次读不到历史，没法判断。
+    # 读不到时**不能**当成没生效去 fork：那会白白把线程换到一个新 key 上。
+    verified = None
+    if tail:
+        verified = (tail[-1]["id"] == item["id"]
+                    and not (dropped_ids & {it["id"] for it in tail}))
     swapped = None
-    if _history_has(skey, nxt["id"]):
+    if verified is False:
         log("thread rewind n=%d 原生没落地，改走 fork 兜底" % n)
         finfo, ferr = fork_at_message(skey, nxt["id"])
         if not finfo:
@@ -625,33 +714,49 @@ def rewind_thread(conv_id, n, skey, arg, mid, groups):
                        "线程会话%d 回退没生效：网关报告成功，但历史里第 %d 条之后"
                        "还在；改用分叉兜底也失败（%s）。没有改动线程指向，"
                        "可以再试一次或先 `aa%d /his` 核对。"
-                       % (n, index, (ferr or "")[:200], n), groups,
+                       % (n, resolved, (ferr or "")[:200], n), groups,
                        "-rewind-noeffect")
             return
         swapped = finfo["key"]
         info = finfo
-    dropped = his_prune(skey, index + 1)
+    dropped = his_prune(skey, resolved + 1)
     if swapped:
-        his_prune(swapped, index + 1)
+        his_prune(swapped, resolved + 1)
     thread_put(conv_id, n, state="idle", started=None, base_ts=0,
                status="rewind", pushes=0, deliver=False, last_ok=time.time(),
-               run="", last_msg="rewind@%d" % index, preview="rewind@%d" % index,
+               run="", last_msg="rewind@%d" % resolved, preview="rewind@%d" % resolved,
                q_forwarded=None, q_deadline=0,
                **({"key": swapped} if swapped else {}))
     log("thread rewind n=%d idx=%d dropped=%d key=%s%s"
-        % (n, index, dropped, _short_skey(swapped or skey),
+        % (n, resolved, dropped, _short_skey(swapped or skey),
            " (fork fallback)" if swapped else ""))
-    cut = _strip_note(info.get("text") or nxt.get("text") or "")
     lines = ["线程会话%d 已回退到第 %d 条之后：保留 #1–#%d，撤掉 #%d 起（`%s`）。"
-             % (n, index, index, index + 1, _short_skey(info.get("key") or skey)),
-             ""]
-    if cut:
-        lines.append("撤掉的第一条原文：")
-        lines.append(cut[:400])
+             % (n, resolved, resolved, resolved + 1,
+                _short_skey(info.get("key") or skey)), ""]
+    if dropped_items:
+        lines.append("这次撤掉 %d 条：" % len(dropped_items))
+        for k, it in enumerate(dropped_items[:3]):
+            stamp = _hhmm(it["at"] / 1000.0) if it["at"] else ""
+            lines.append("#%d%s %s" % (resolved + k + 1,
+                                       ("（%s）" % stamp) if stamp else "",
+                                       it["text"][:60].replace("```", "'''")))
+        if len(dropped_items) > 3:
+            lines.append("…以及另外 %d 条。" % (len(dropped_items) - 3))
         lines.append("")
+    else:
+        cut = _strip_note(info.get("text") or nxt.get("text") or "")
+        if cut:
+            lines += ["撤掉的第一条原文：", cut[:400], ""]
     lines.append("改完直接发 `aa%d <正文>`，不想改就继续。" % n)
-    lines.append("提醒：只回退了上下文，**之前跑过的命令、改过的文件还在**；"
-                 "编号 >= %d 的已作废，要重新分叉先 `/his`。" % (index + 1))
+    lines.append("编号是全量序号，`aa%d /his` 现在的编号和这里一致；"
+                 ">= %d 的已作废。" % (n, resolved + 1))
+    lines.append("提醒：只回退了上下文，**之前跑过的命令、改过的文件还在**。")
+    if not complete:
+        lines.append("注：历史太长没读全，这次按编号表里的 entry 切的，"
+                     "下次 `/his` 的编号可能重新算。")
+    if verified is None:
+        lines.append("注：这次没读到回退后的历史（gateway 忙），命令已提交但没复核；"
+                     "发 `aa%d /his` 确认一下。" % n)
     if swapped:
         lines.append("")
         lines.append("说明：网关原生回退这次没落地（历史没被裁），我改用"
@@ -724,7 +829,7 @@ def fork_at_index_thread(conv_id, n, skey, source, index, mid, groups):
                      % _short_skey(old_key))
     # 带编号的 fork 才附列表 + 分叉点标记（用户 2026-10-29 要求）：
     # 让用户一眼看到「从哪条之后切开的」，编号取自新会话自己的前缀。
-    items = _collect_items(info["key"])
+    items, _complete = _collect_items(info["key"])
     if items:
         numbered, _total = _number_items(info["key"], items)
         lines.append("")
@@ -737,17 +842,6 @@ def _gateway_msg_id(m):
     """一条消息的稳定标识（网关历史里的），用来做回显收取的 id 基线。"""
     ow = m.get("__openclaw") or {}
     return ow.get("id") or ("ts:%s" % m.get("timestamp"))
-
-
-def _history_has(skey, entry_id):
-    """历史里还有没有这条消息（用来复核 rewind 到底剪没剪）。"""
-    try:
-        for m in history_raw(skey, limit=500) or []:
-            if _gateway_msg_id(m) == entry_id:
-                return True
-    except Exception:
-        pass
-    return False
 
 
 def reset_thread(conv_id, n, skey, mid, groups):

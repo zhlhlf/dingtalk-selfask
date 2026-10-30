@@ -108,5 +108,23 @@ from selfask_config import UNATTENDED_NOTE
 assert "不要用 ask_user" in UNATTENDED_NOTE and "停下等我回复" in UNATTENDED_NOTE
 assert UNATTENDED_NOTE.count("\n") == 2 and len(UNATTENDED_NOTE.encode()) < 300
 
+# 6) 编号必须按**整条活跃分支**的全量序号（2026-10-30 修的 bug）：
+#    用户那 5 条其实是会话第 12–16 条，老代码按「最近窗口」重新从 1 数，
+#    /rewind 之后窗口一滑，编号全变，看着像没生效。
+_saved_put, _saved_show = th.his_put, th.HIS_SHOW
+_pinned = []
+try:
+    th.his_put = lambda skey, items: _pinned.extend(items)
+    th.HIS_SHOW = 8
+    items = [{"id": "e%d" % i, "text": "第%d条" % i, "at": i * 1000}
+             for i in range(1, 13)]
+    numbered, total = th._number_items("dthread-x", items)
+    assert total == 12
+    assert [num for num, _ in numbered] == [5, 6, 7, 8, 9, 10, 11, 12], numbered
+    assert numbered[-1][1]["text"] == "第12条"
+    assert [it["n"] for it in _pinned] == [5, 6, 7, 8, 9, 10, 11, 12]
+finally:
+    th.his_put, th.HIS_SHOW = _saved_put, _saved_show
+
 print("PASS: routing, import surface, threads.json merge-on-first-write, "
-      "latest_thread, question-forward + plain answers")
+      "latest_thread, question-forward + plain answers, absolute numbering")
