@@ -143,6 +143,8 @@ RESET_CMDS = ("/new", "/reset", "/clear")
 # （2026-10-29 用户实测）。本地拦下、直接调 sessions.abort 才停得下来。
 STOP_CMDS = ("/stop", "/abort")
 
-# `/his`、`/rewind` 默认列多少条自己的消息；0 = 全部。
-# 2026-10-29 用户要求默认 8 条（先全列、后改成 8），编号仍按全量顺序给。
-HIS_SHOW = 8
+# `/his`、`/rewind` 列多少条自己的消息；0 = 全部。
+# 2026-10-29 先要求全列、后改成 8；2026-10-30 又要回「全部列」——所以默认
+# 0（全列），想只看最近几条时用环境变量收窄（如 SELFASK_HIS_SHOW=10）。
+# 编号始终是全量序号，跟这个显示条数无关；超长由 chunk_text 分条发。
+HIS_SHOW = int(os.environ.get("SELFASK_HIS_SHOW", "0") or 0)
