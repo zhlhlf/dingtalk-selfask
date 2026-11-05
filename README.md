@@ -226,7 +226,7 @@ send_reply → dws chat message send（群：--conversation-id + @占位符；�
 | 项 | 值 | 环境变量 |
 | --- | --- | --- |
 | 线程硬上限 | 7200s（2h），到点尝试 `sessions.abort`；非 owner 时 reset 兜底并回已有进展 | `SELFASK_TASK_HARD_LIMIT` |
-| 进度回报 | 每 900s（15min）一条 | `SELFASK_PROGRESS_EVERY` |
+| 进度回报 | 每 300s（5min）一条 | `SELFASK_PROGRESS_EVERY` |
 | 状态轮询 | 20s | `SELFASK_POLL` |
 | 并发上限 | 4 | `SELFASK_MAX_CONCURRENCY` |
 

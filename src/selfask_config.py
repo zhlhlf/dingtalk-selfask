@@ -67,7 +67,7 @@ THREAD_PREFIX = "dthread-"
 
 TASK_HARD_LIMIT = int(os.environ.get("SELFASK_TASK_HARD_LIMIT",
                                      os.environ.get("SELFASK_AGENT_TIMEOUT", "7200")))  # 子任务硬上限，默认 2h
-PROGRESS_EVERY = int(os.environ.get("SELFASK_PROGRESS_EVERY", "900"))      # 每 15 分钟报一次进度
+PROGRESS_EVERY = int(os.environ.get("SELFASK_PROGRESS_EVERY", "300"))      # 每 5 分钟报一次进度
 POLL_INTERVAL = int(os.environ.get("SELFASK_POLL", "20"))                  # 监控轮询间隔（秒）
 MAX_CONCURRENCY = int(os.environ.get("SELFASK_MAX_CONCURRENCY", "6"))  # 同时跑几条 agent
 CHUNK = int(os.environ.get("SELFASK_CHUNK", "18000"))               # 单条消息最大字符数
