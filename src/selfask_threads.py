@@ -13,7 +13,7 @@ import time
 from selfask_config import (TASK_HARD_LIMIT, PROGRESS_EVERY, POLL_INTERVAL,
                             MAX_CONCURRENCY, UNATTENDED_NOTE, RESET_CMDS,
                             STOP_CMDS, HIS_SHOW)
-from selfask_util import log, human_dur, _hhmm
+from selfask_util import log, human_dur, _hhmm, short_skey
 from selfask_state import (thread_get, thread_put, thread_ensure, thread_alloc,
                            conv_threads, thread_key, threads_snapshot,
                            his_put, his_get, his_prune)
@@ -21,7 +21,8 @@ from selfask_gateway import (session_state, session_send, session_abort,
                              session_reset, stop_run, history_raw, await_reply,
                              question_pending, question_resolve,
                              session_fork, history_count, fork_at_message,
-                             rewind_at_message, history_all, _msg_text)
+                             rewind_at_message, history_all, _msg_text,
+                             resolve_skey)
 from selfask_dingtalk import send_reply as _send_reply, check_live_health
 
 
@@ -304,9 +305,12 @@ def slash_thread(conv_id, n, skey, raw, mid, groups):
 
 
 def _short_skey(skey):
-    """显示/比较用的短 key：`agent:main:dthread-x` → `dthread-x`。"""
-    value = (skey or "").strip().strip("`'\"")
-    return value.split(":")[-1] if ":" in value else value
+    """显示/比较用的短 key：`agent:main:dthread-x` → `dthread-x`。
+
+    只剥 `agent:<id>:`，`dashboard:<uuid>` 这类中间段要留着——老实现取
+    最后一段，用户复制出去的 uuid 网关解析不到原会话（2026-11-05 bug）。
+    """
+    return short_skey(skey)
 
 
 def _same_skey(a, b):
@@ -501,6 +505,16 @@ def fork_thread(conv_id, n, skey, arg, mid, groups):
                    "（编号先发 `/his` 拿）。发 `aa0` 能看到各线程的 key。" % (n, n),
                    groups, "-fork-usage")
         return
+    # 用户抄来的 key 可能只是尾段（Control UI 的 uuid / `dashboard:…`），
+    # 先归一到网关认得的完整 key 再判空、再当 parentSessionKey。
+    src_key, rerr = resolve_skey(source)
+    if not src_key:
+        t_reply(n, conv_id, mid,
+                   "找不到会话 `%s`：%s。`aa0` 里的 key 可以直接复制，"
+                   "Control UI 里的会话 id 也认。" % (source, rerr or "列表里没有"),
+                   groups, "-fork-srcfail")
+        return
+    source = src_key
     if _same_skey(source, skey):
         t_reply(n, conv_id, mid,
                    "线程会话%d 的 key 就是 `%s`，整段复制到自己身上没有意义。"
@@ -533,8 +547,9 @@ def fork_thread(conv_id, n, skey, arg, mid, groups):
         return
     if not scount:
         t_reply(n, conv_id, mid,
-                   "源会话 `%s` 没有历史消息（key 不对，或者它本来就是空的）。"
-                   "发 `aa0` 核对一下 key。" % source, groups, "-fork-empty")
+                   "源会话 `%s` 在网关里是空的（key 已按会话列表核对过）。"
+                   "如果它其实有内容，把完整 key 或 Control UI 的会话 id 发我。"
+                   % _short_skey(source), groups, "-fork-empty")
         return
 
     info, ferr = session_fork(source, skey)

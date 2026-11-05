@@ -385,6 +385,73 @@ def history_count(skey, limit=200):
     return len(messages), ""
 
 
+def session_rows(limit=200, max_pages=5):
+    """列出网关上的会话（key/sessionId/updatedAt），返回 (rows, err)。
+
+    只给 key 归一用；拿不到列表时返回 (None, err)，调用方按字面 key 继续。
+    """
+    rows, offset = [], 0
+    for _ in range(max_pages):
+        rc, out, err = gw_call("sessions.list",
+                               {"limit": limit, "offset": offset}, timeout=30)
+        if rc != 0:
+            return None, ((_clean_err(err) or _clean_err(out)) or "rc=%s" % rc)[-200:]
+        try:
+            d = json.loads(out)
+        except Exception as e:
+            return None, "sessions.list json fail %r" % e
+        batch = d.get("sessions") or []
+        rows.extend(batch)
+        if not d.get("hasMore") or not batch:
+            break
+        offset = d.get("nextOffset") or (offset + len(batch))
+    return rows, ""
+
+
+def resolve_skey(source):
+    """把用户抄来的会话标识归一成网关认得的完整 key，返回 (key, err)。
+
+    2026-11-05 修：旧版把用户输入直接当 key 用，用户从 Control UI / `aa0`
+    抄到 `fe85a6cb-…`（其实是 `agent:main:dashboard:fe85a6cb-…` 的尾段），
+    网关按默认 agent 前缀解析成 `agent:main:fe85a6cb-…`，历史是空的，
+    `/fork` 于是报「源会话没有历史消息」，可会话明明有 72k tokens。
+
+    接受：完整 key、去掉 `agent:<id>:` 的 key（`dthread-x` / `dashboard:x` /
+    `tui-x`）、以及 Control UI 显示的 sessionId（uuid）。找不到返回 (None, err)；
+    列表本身拿不到时按字面 key 返回，交给 `history_count` 再判。
+    """
+    raw = (source or "").strip().strip("`'\"")
+    if not raw:
+        return None, "key 是空的"
+    rows, lerr = session_rows()
+    if rows is None:
+        return ("agent:main:" + raw if not raw.startswith("agent:") else raw), ""
+    keys = [r.get("key") for r in rows if r.get("key")]
+    if raw.startswith("agent:"):
+        cands = [raw]
+    else:
+        cands = ["agent:main:" + raw,
+                 "agent:main:dashboard:" + raw,
+                 "agent:main:tui-" + raw]
+    for c in cands:
+        if c in keys:
+            return c, ""
+    # 按后缀匹配：`dashboard:<uuid>`、`<uuid>`、或跨 agent 的 `tui-x`
+    hits = [k for k in keys if k.endswith(":" + raw)]
+    if hits:
+        if len(hits) > 1:
+            by = {r.get("key"): (r.get("updatedAt") or 0) for r in rows}
+            hits.sort(key=lambda k: by.get(k) or 0, reverse=True)
+        return hits[0], ""
+    sid = [r.get("key") for r in rows
+           if (r.get("sessionId") or "") == raw and r.get("key")]
+    if sid:
+        return sid[0], ""
+    if raw.startswith("agent:"):
+        return raw, ""          # 完整 key 但列表里没有（如已归档）：按字面试
+    return None, (lerr or "会话列表里没有 `%s`" % raw)
+
+
 def question_pending(skey):
     """该会话挂着的待答问题，没有就返回 None。
 

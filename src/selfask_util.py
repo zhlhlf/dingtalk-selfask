@@ -40,6 +40,21 @@ def human_dur(sec):
     return "%dh%02dm" % (sec // 3600, (sec % 3600) // 60)
 
 
+def short_skey(skey):
+    """显示/复制用的短 key：只剥掉 `agent:<id>:` 这一段。
+
+    老实现取 `split(":")[-1]`，把 `agent:main:dashboard:<uuid>` 削成 `<uuid>`；
+    用户照着这个 uuid 去 `/fork` 时，网关把它解析成 `agent:main:<uuid>`，
+    查不到历史（2026-11-05 实测 bug：源会话明明有 72k tokens）。
+    保留 `dashboard:` / `tui-` 这类中间段，复制出去才还是能用的 key。
+    """
+    value = (skey or "").strip().strip("`'\"")
+    parts = value.split(":")
+    if len(parts) >= 3 and parts[0] == "agent":
+        return ":".join(parts[2:])
+    return value
+
+
 def _hhmm(ts):
     try:
         return time.strftime("%H:%M", time.localtime(ts))

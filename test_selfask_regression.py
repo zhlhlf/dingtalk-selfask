@@ -108,6 +108,15 @@ from selfask_config import UNATTENDED_NOTE
 assert "不要用 ask_user" in UNATTENDED_NOTE and "停下等我回复" in UNATTENDED_NOTE
 assert UNATTENDED_NOTE.count("\n") == 2 and len(UNATTENDED_NOTE.encode()) < 300
 
+# 5.1) 短 key 只剥 `agent:<id>:`，不能把 `dashboard:<uuid>` 削成 uuid
+#      （2026-11-05 bug：用户复制 aa0/UI 里的 uuid 去 /fork，网关解析成
+#      `agent:main:<uuid>`，历史为空，误报「源会话没有历史消息」）
+from selfask_util import short_skey
+assert short_skey("agent:main:dthread-x") == "dthread-x"
+assert short_skey("dthread-x") == "dthread-x"
+assert short_skey("agent:main:dashboard:abc-123") == "dashboard:abc-123"
+assert short_skey("agent:ops:tui-9") == "tui-9"
+
 # 6) 编号必须按**整条活跃分支**的全量序号（2026-10-30 修的 bug）：
 #    用户那 5 条其实是会话第 12–16 条，老代码按「最近窗口」重新从 1 数，
 #    /rewind 之后窗口一滑，编号全变，看着像没生效。
