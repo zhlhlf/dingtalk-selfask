@@ -18,7 +18,8 @@ from selfask_state import (thread_get, thread_put, thread_ensure, thread_alloc,
                            conv_threads, thread_key, threads_snapshot,
                            his_put, his_get, his_prune)
 from selfask_gateway import (session_state, session_send, session_abort,
-                             session_reset, stop_run, history_raw, await_reply,
+                             session_reset, session_recreate, stop_run,
+                             history_raw, await_reply,
                              question_pending, question_resolve,
                              session_fork, history_count, fork_at_message,
                              rewind_at_message, history_all, _msg_text,
@@ -872,7 +873,13 @@ def reset_thread(conv_id, n, skey, mid, groups):
     if was_active:
         session_abort(skey)
         time.sleep(2)
-    ok, err = session_reset(skey)
+    # 用户口径（2026-11-07）：旧的会话可能已经归档/丢失/带着一团历史，
+    # /new 就直接删掉重开一个同 key 的新会话，不折腾恢复 + reset。
+    ok, err = session_recreate(skey)
+    if not ok:
+        # 兜底：删除被拒时（例如权限/并发），再走「恢复归档 + reset」。
+        log("thread %d recreate failed, fallback reset: %s" % (n, err[-160:]))
+        ok, err = session_reset(skey)
     if not ok:
         t_reply(n, conv_id, mid,
                    "线程会话%d 重置失败：%s" % (n, err),

@@ -179,6 +179,16 @@ def session_send(skey, message, steer=False, idem=None):
     if steer:
         params["queueMode"] = "steer"
     rc, out, err = gw_call("chat.send", params, timeout=30)
+    # 线程会话被归档（Control UI 手动归档或清理策略）后，chat.send 会直接
+    # 报 `Session "..." is archived. Restore it before starting new work.`。
+    # 恢复后重试一次，用户不用自己回 Control UI 点「恢复」。
+    if rc != 0 and _archived_hit((out or "") + (err or "")):
+        rok, rerr = session_restore(skey)
+        if rok:
+            log("send key=%s retry after restore" % skey[-12:])
+            rc, out, err = gw_call("chat.send", params, timeout=30)
+        else:
+            return None, ("会话已归档，恢复失败：%s" % rerr)[-300:]
     if rc != 0:
         # 网关的业务错误在 stdout 的 JSON 里；stderr 往往只有 Node 的
         # NODE_EXTRA_CA_CERTS 警告。优先把 stdout 的 error.message 报出来。
@@ -236,6 +246,10 @@ def stop_run(skey, clear_queued=True):
     log("abort key=%s 授权被拒（非 owner），改用 reset 停 run" % skey[-12:])
     rc2, out2, err3 = gw_call("sessions.reset", {"key": skey}, timeout=60)
     ok = rc2 == 0 and _ok_blob(out2)
+    if not ok and _archived_hit((out2 or "") + (err3 or "")):
+        if session_restore(skey)[0]:
+            rc2, out2, err3 = gw_call("sessions.reset", {"key": skey}, timeout=60)
+            ok = rc2 == 0 and _ok_blob(out2)
     log("abort key=%s reset rc=%s ok=%s" % (skey[-12:], rc2, ok))
     if not ok:
         return False, "reset", (err3 or out2 or "")[:200]
@@ -252,11 +266,131 @@ def session_abort(skey):
 
 
 def session_reset(skey):
-    """直接走 sessions.reset（reset 家族命令用，返回 (ok, err)。"""
+    """直接走 sessions.reset（reset 家族命令用，返回 (ok, err)。
+
+    已归档的会话会被网关直接拒绝（`Session "..." is archived. Restore it
+    before starting new work.`），重置前先恢复一次再重试。
+    """
     rc, out, err = gw_call("sessions.reset", {"key": skey}, timeout=60)
     ok = rc == 0 and _ok_blob(out)
     if not ok:
+        if _archived_hit((out or "") + (err or "")):
+            rok, rerr = session_restore(skey)
+            if not rok:
+                return False, ("会话已归档，恢复失败：%s" % rerr)[:300]
+            rc, out, err = gw_call("sessions.reset", {"key": skey}, timeout=60)
+            ok = rc == 0 and _ok_blob(out)
+            if ok:
+                log("session reset key=%s after restore" % skey[-12:])
+                return True, ""
         return False, (err or out or "")[:300]
+    return True, ""
+
+
+_ARCHIVED_MARK = "is archived"
+
+
+def _archived_hit(text):
+    return _ARCHIVED_MARK in (text or "").lower()
+
+
+def session_restore(skey):
+    """把一个已归档的会话恢复出来，返回 (ok, err)。
+
+    归档是网关的正常状态（Control UI 手动归档、清理策略都会做）。归档后
+    不仅 `sessions.reset` 被拒，`chat.send` 也直接报 `Session "..." is
+    archived. Restore it before starting new work.`。
+
+    恢复走 `sessions.patch { archived: false }`，必须带 describe 拿到的当前
+    `sessionId` 作为 `expectedSessionId`（网关用它防并发覆盖）。
+    """
+    sid = ""
+    rc, out, err = gw_call("sessions.describe", {"key": skey}, timeout=30)
+    if rc == 0:
+        try:
+            d = json.loads(out)
+            s = d.get("session") or {}
+            sid = s.get("sessionId") or ""
+            if not s.get("archived"):
+                return True, ""
+        except Exception:
+            pass
+    params = {"key": skey, "archived": False}
+    if sid:
+        params["expectedSessionId"] = sid
+    rc, out, err = gw_call("sessions.patch", params, timeout=30)
+    if rc == 0:
+        try:
+            d = json.loads(out)
+            if d.get("ok") is False or d.get("error"):
+                raise ValueError((d.get("error") or {}).get("message") or "patch failed")
+            log("session restore key=%s" % skey[-12:])
+            return True, ""
+        except Exception as e:
+            return False, ("恢复归档会话失败：%s" % e)[:300]
+    detail = (out or "").strip()
+    try:
+        d = json.loads(detail)
+        msg = ((d.get("error") or {}).get("message") or "").strip()
+        if msg:
+            detail = msg
+    except Exception:
+        pass
+    return False, (detail or err or "")[-300:]
+
+
+def _agent_of(skey):
+    """从 `agent:<id>:...` 里取 agentId；取不到就返回空串。"""
+    parts = (skey or "").split(":")
+    if len(parts) >= 3 and parts[0] == "agent" and parts[1]:
+        return parts[1]
+    return ""
+
+
+def session_recreate(skey):
+    """把线程会话整个换成一个全新的（`aaN /new` 用）。
+
+    用户口径（2026-11-07）：「原来的会话没有了就直接新建一个，不管旧的」。
+    旧会话可能已归档、丢失或带一堆历史，`sessions.reset` 在归档态还会被拒。
+    这里先 `sessions.delete`（网关会把旧 transcript 压成归档文件），再用**同一个
+    key** `sessions.create`，线程绑定因此不变，push/monitor 不用改指向。
+
+    返回 (ok, err)。
+    """
+    rc, out, err = gw_call("sessions.delete", {"key": skey}, timeout=60)
+    if rc != 0:
+        detail = (out or "").strip()
+        try:
+            d = json.loads(detail)
+            msg = ((d.get("error") or {}).get("message") or "").strip()
+            if msg:
+                detail = msg
+        except Exception:
+            pass
+        log("session delete key=%s rc=%s %s" % (skey[-12:], rc, (detail or err)[-160:]))
+        return False, ("删除旧会话失败：%s" % ((detail or err or "")[-300:]))
+    params = {"key": skey}
+    aid = _agent_of(skey)
+    if aid:
+        params["agentId"] = aid
+    rc, out, err = gw_call("sessions.create", params, timeout=60)
+    if rc != 0:
+        detail = (out or "").strip()
+        try:
+            d = json.loads(detail)
+            msg = ((d.get("error") or {}).get("message") or "").strip()
+            if msg:
+                detail = msg
+        except Exception:
+            pass
+        return False, ("新建会话失败：%s" % ((detail or err or "")[-300:]))
+    try:
+        d = json.loads(out)
+    except Exception as e:
+        return False, "sessions.create json fail %r" % e
+    if d.get("ok") is False or d.get("error"):
+        return False, json.dumps(d.get("error"), ensure_ascii=False)[:300]
+    log("session recreate key=%s sid=%s" % (skey[-12:], d.get("sessionId") or ""))
     return True, ""
 
 
