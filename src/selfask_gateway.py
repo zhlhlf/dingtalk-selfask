@@ -369,6 +369,11 @@ def session_recreate(skey):
             pass
         log("session delete key=%s rc=%s %s" % (skey[-12:], rc, (detail or err)[-160:]))
         return False, ("删除旧会话失败：%s" % ((detail or err or "")[-300:]))
+    return session_create(skey)
+
+
+def session_create(skey):
+    """用指定 key 新建一个空会话，返回 (ok, err)。"""
     params = {"key": skey}
     aid = _agent_of(skey)
     if aid:
@@ -390,8 +395,35 @@ def session_recreate(skey):
         return False, "sessions.create json fail %r" % e
     if d.get("ok") is False or d.get("error"):
         return False, json.dumps(d.get("error"), ensure_ascii=False)[:300]
-    log("session recreate key=%s sid=%s" % (skey[-12:], d.get("sessionId") or ""))
+    log("session create key=%s sid=%s" % (skey[-12:], d.get("sessionId") or ""))
     return True, ""
+
+
+def session_new(skey):
+    """`aaN /new` 的唯一入口：会话存在就清空上下文，不存在就直接新建。
+
+    用户口径（2026-11-07）：优先「清空」，别动不动删会话；只有 reset 走不通
+    （归档恢复失败、会话损坏等）才退回「删旧 + 同 key 新建」。
+    返回 (ok, err, how)，how 为 `reset` / `created` / `recreated`。
+    """
+    exists = False
+    rc, out, err = gw_call("sessions.describe", {"key": skey}, timeout=30)
+    if rc == 0:
+        try:
+            exists = bool((json.loads(out) or {}).get("session"))
+        except Exception:
+            pass
+    if not exists:
+        ok, cerr = session_create(skey)
+        return (ok, cerr, "created" if ok else "")
+    ok, rerr = session_reset(skey)   # 内部已处理归档：先恢复再 reset
+    if ok:
+        return True, "", "reset"
+    log("session new key=%s reset failed, recreate: %s" % (skey[-12:], rerr[-160:]))
+    ok2, cerr = session_recreate(skey)
+    if ok2:
+        return True, "", "recreated"
+    return False, (rerr or cerr)[-300:], ""
 
 
 def fork_at_message(source_skey, entry_id):

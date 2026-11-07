@@ -18,7 +18,7 @@ from selfask_state import (thread_get, thread_put, thread_ensure, thread_alloc,
                            conv_threads, thread_key, threads_snapshot,
                            his_put, his_get, his_prune)
 from selfask_gateway import (session_state, session_send, session_abort,
-                             session_reset, session_recreate, stop_run,
+                             session_reset, session_recreate, session_new, stop_run,
                              history_raw, await_reply,
                              question_pending, question_resolve,
                              session_fork, history_count, fork_at_message,
@@ -873,13 +873,9 @@ def reset_thread(conv_id, n, skey, mid, groups):
     if was_active:
         session_abort(skey)
         time.sleep(2)
-    # 用户口径（2026-11-07）：旧的会话可能已经归档/丢失/带着一团历史，
-    # /new 就直接删掉重开一个同 key 的新会话，不折腾恢复 + reset。
-    ok, err = session_recreate(skey)
-    if not ok:
-        # 兜底：删除被拒时（例如权限/并发），再走「恢复归档 + reset」。
-        log("thread %d recreate failed, fallback reset: %s" % (n, err[-160:]))
-        ok, err = session_reset(skey)
+    # 用户口径（2026-11-07）：会话存在就直接清空上下文，不存在就新建；
+    # 只有 reset 走不通（归档恢复失败/会话损坏）才退回删旧重建。
+    ok, err, how = session_new(skey)
     if not ok:
         t_reply(n, conv_id, mid,
                    "线程会话%d 重置失败：%s" % (n, err),
@@ -888,9 +884,16 @@ def reset_thread(conv_id, n, skey, mid, groups):
     # 必须清掉本线程的运行账：否则 monitor 会拿重置后的空历史报「跑完了没正文」
     thread_put(conv_id, n, state="idle", started=None, base_ts=0, status="reset",
                pushes=0, deliver=False, last_ok=time.time())
-    log("thread reset n=%d was_active=%s" % (n, was_active))
-    msg = ("线程会话%d 已重置，上下文清空。接着发 `aa%d <正文>` 就是全新一轮。"
-           % (n, n))
+    log("thread reset n=%d was_active=%s how=%s" % (n, was_active, how))
+    if how == "created":
+        msg = ("线程会话%d 原来没有可用会话，已新建一个空的。"
+               "接着发 `aa%d <正文>` 就是全新一轮。" % (n, n))
+    elif how == "recreated":
+        msg = ("线程会话%d 的旧会话重置失败，已删除重建为空会话（旧 transcript 由网关归档）。"
+               "接着发 `aa%d <正文>` 就是全新一轮。" % (n, n))
+    else:
+        msg = ("线程会话%d 已重置，上下文清空。接着发 `aa%d <正文>` 就是全新一轮。"
+               % (n, n))
     if was_active:
         msg += "\n（原来那轮还在跑，我先中断再重置的。）"
     t_reply(n, conv_id, mid, msg, groups, "-reset")
